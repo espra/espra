@@ -20,6 +20,14 @@ coverage.txt
 cpu.prof
 mem.prof
 
+# Rust
+
+debug/
+target/
+
+*.pdb
+**/*.rs.bk
+
 # Zig
 
 zig-cache/
