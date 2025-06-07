@@ -1,0 +1,25 @@
+# Rust formatting configuration
+
+# Use the 2024 edition
+edition = "2024"
+
+# Common settings that align with ecosystem standards
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Auto"
+use_small_heuristics = "Default"
+
+# Import and use formatting
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+reorder_imports = true
+reorder_modules = true
+
+# Match default Rust style
+trailing_comma = "Vertical"
+match_block_trailing_comma = false
+
+# Keep code readable
+use_field_init_shorthand = true
+use_try_shorthand = true
