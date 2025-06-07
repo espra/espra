@@ -1,12 +1,23 @@
-# System-wide excludes
+# macOS
 
 .DS_Store
+
+# Windows
+
+Desktop.ini
+Thumbs.db
 
 # IDEs
 
 *~
+*.swo
+*.swp
 .idea/
 .vscode/
+
+# AI tools
+
+.aider.chat.history.md
 
 # Generated files
 
@@ -30,5 +41,6 @@ target/
 
 # Zig
 
-zig-cache/
+*.o
+.zig-cache/
 zig-out/
