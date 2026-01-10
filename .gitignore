@@ -1,0 +1,81 @@
+# Environment files
+
+.env
+.env.local
+.env.*.local
+
+# Temporary files
+
+*.tmp
+*.log
+temp/
+tmp/
+
+# Linux
+
+.fuse_hidden*
+.nfs*
+
+# macOS
+
+.DS_Store
+
+# Windows
+
+Desktop.ini
+Thumbs.db
+
+# IDEs
+
+*~
+*.swo
+*.swp
+.idea/
+.vscode/
+
+# AI tools
+
+.aider.chat.history.md
+
+# Generated files
+
+*.dll
+*.dylib
+*.exe
+*.gen.go
+*.pb.go
+*.so
+*.test
+coverage.txt
+
+# Compressed files
+
+*.gz
+*.tar
+*.tar.*
+*.tgz
+*.xz
+*.zip
+
+# Go
+
+*.out
+cpu.prof
+go.work
+go.work.sum
+mem.prof
+vendor/
+
+# Rust
+
+*.pdb
+**/*.rs.bk
+Cargo.lock
+debug/
+target/
+
+# Zig
+
+*.o
+.zig-cache/
+zig-out/
