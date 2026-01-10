@@ -27,11 +27,14 @@
 
 tav {
     email = tav@espra.com
-    github = tav
     location {
         area = London
         country = GB
     }
     name = tav
-    twitter = tav
+    socials {
+        github = tav
+        linkedin = asktav
+        x = tav
+    }
 }
