@@ -602,3 +602,46 @@ The top level can contain:
 
 Duplicate keys at the top level result in an error, and follow the same rules as
 blocks.
+
+### Versioned Blocks
+
+Versioned blocks allow config files to support a future version whilst still
+being compatible with existing deployments. This solves the tension between
+catching typos, while allowing for new config values.
+
+```xon
+server {
+    host = example.com
+    port = 8080
+    [v5] {
+        tls mode = strict
+    }
+}
+```
+
+When decoding for version 4, only `host` and `port` are accepted. When decoding
+for version 5 or above, `tls mode` is also accepted. Unknown keys outside of
+versioned blocks always result in an error when `DecodeVersion` is used:
+
+```go
+cfg := &Config{}
+err := xon.DecodeVersion(data, cfg, 4)  // ignores [v5] block
+err := xon.DecodeVersion(data, cfg, 5)  // includes [v5] block
+```
+
+Rules:
+
+* Versioned blocks use the syntax `[v<N>]` where `<N>` is a positive integer.
+
+* Versioned blocks can appear anywhere a regular block can, i.e. at the top
+  level and at any nested depth.
+
+* Versioned blocks can contain key/value pairs and nested blocks that are merged
+  with the contents of their parent block.
+
+* Any keys that are duplicated inside a version block and its parent must result
+  in an error.
+
+* Only one versioned block number can be used within a config file at any given
+  time. This is to ensure that applications update their config so that cruft
+  doesn't accumulate.
