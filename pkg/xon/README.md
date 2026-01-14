@@ -99,6 +99,31 @@ We specify standards for conversion to common data types:
   * Supports the special values of `nan`, `inf`, `-inf`, and `+inf` (lowercase
     only).
 
+* Time-related values:
+
+  * Datetime values use the common RFC 3339 format,
+    `YYYY-MM-DDTHH:MM:SS[.SSS...](Z|±HH:MM)` with optional sub-second precision.
+    The timezone component must either be `Z` for UTC, or a `±HH:MM` offset.
+
+    ```xon
+    created = 2026-01-15T10:30:00Z
+    expires = 2026-01-15T23:30:00.123456789+05:30
+    ```
+
+  * Datetime values that cannot be formatted as RFC 3339, e.g. when the year
+    exceeds 9999, must error.
+
+  * Time duration values are encoded like `14h35m0.2s`. Durations can be
+    positive or negative, and the accepted units are `w`, `d`, `h`, `m`, `s`,
+    `ms`, `µs`, `μs`, `us`, and `ns`. All units must be whole integers, except
+    `s` which can be fractional.
+
+    ```xon
+    timeout = 30s
+    interval = 1h30m
+    offset = -4h30m
+    ```
+
 * Optional values:
 
   * The literal `nil` translates to "empty"/None/null for pointer or optional
