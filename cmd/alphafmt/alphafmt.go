@@ -269,9 +269,20 @@ func formatDecl(fset *token.FileSet, comments []*ast.CommentGroup, decl ast.Decl
 		Mode:     printer.TabIndent | printer.UseSpaces,
 		Tabwidth: 8,
 	}
+	var docComment *ast.CommentGroup
+	if gen, ok := decl.(*ast.GenDecl); ok && gen.Doc != nil {
+		docComment = gen.Doc
+		gen.Doc = nil
+	}
 	node := &printer.CommentedNode{
 		Comments: commentsForDecl(comments, decl),
 		Node:     decl,
+	}
+	if docComment != nil {
+		for _, line := range docComment.List {
+			buf.WriteString(line.Text)
+			buf.WriteByte('\n')
+		}
 	}
 	if err := cfg.Fprint(buf, fset, node); err != nil {
 		obs.Fatalf("Failed to format declaration: %v", err)
@@ -520,11 +531,20 @@ func splitTypeDecls(decl *ast.GenDecl) []declItem {
 		if !ok {
 			continue
 		}
+		newTypeSpec := &ast.TypeSpec{
+			Assign:     typeSpec.Assign,
+			Comment:    typeSpec.Comment,
+			Name:       typeSpec.Name,
+			Type:       typeSpec.Type,
+			TypeParams: typeSpec.TypeParams,
+		}
 		newDecl := &ast.GenDecl{
-			Specs: []ast.Spec{spec},
+			Specs: []ast.Spec{newTypeSpec},
 			Tok:   token.TYPE,
 		}
-		if i == 0 && decl.Doc != nil && typeSpec.Doc == nil {
+		if typeSpec.Doc != nil {
+			newDecl.Doc = typeSpec.Doc
+		} else if i == 0 && decl.Doc != nil {
 			newDecl.Doc = decl.Doc
 		}
 		items = append(items, declItem{
@@ -546,11 +566,19 @@ func splitValueDecls(decl *ast.GenDecl) (ast.Decl, []declItem) {
 		if !ok || len(valueSpec.Names) == 0 {
 			continue
 		}
+		newValueSpec := &ast.ValueSpec{
+			Comment: valueSpec.Comment,
+			Names:   valueSpec.Names,
+			Type:    valueSpec.Type,
+			Values:  valueSpec.Values,
+		}
 		newDecl := &ast.GenDecl{
-			Specs: []ast.Spec{spec},
+			Specs: []ast.Spec{newValueSpec},
 			Tok:   decl.Tok,
 		}
-		if i == 0 && decl.Doc != nil && valueSpec.Doc == nil {
+		if valueSpec.Doc != nil {
+			newDecl.Doc = valueSpec.Doc
+		} else if i == 0 && decl.Doc != nil {
 			newDecl.Doc = decl.Doc
 		}
 		singles = append(singles, declItem{
