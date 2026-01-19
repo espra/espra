@@ -687,17 +687,20 @@ func main() {
 	files := collectGoFiles(paths)
 	for _, path := range files {
 		changed, out := formatFile(path)
-		if *list && changed {
-			fmt.Println(path)
+		if *list {
+			if changed {
+				fmt.Println(path)
+			}
+			continue
 		}
-		if *write && changed {
-			if err := os.WriteFile(path, out, 0o644); err != nil {
-				obs.Fatalf("Failed to write output to %q: %v", path, err)
+		if *write {
+			if changed {
+				if err := os.WriteFile(path, out, 0o644); err != nil {
+					obs.Fatalf("Failed to write output to %q: %v", path, err)
+				}
 			}
-		} else if !*list {
-			if _, err := os.Stdout.Write(out); err != nil {
-				obs.Fatalf("Failed to write to stdout: %v", err)
-			}
+		} else if _, err := os.Stdout.Write(out); err != nil {
+			obs.Fatalf("Failed to write to stdout: %v", err)
 		}
 	}
 }
