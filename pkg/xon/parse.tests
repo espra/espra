@@ -1,0 +1,664 @@
+// A comment
+---
+{"comment":"A comment"}
+-----
+// Comment with trailing space 
+---
+{"comment":"Comment with trailing space "}
+-----
+key = value
+---
+{"key_value":{"key":"key","value":{"value":"value"}}}
+-----
+key = "quoted value"
+---
+{"key_value":{"key":"key","value":{"quoted":true,"value":"quoted value"}}}
+-----
+key with spaces = value with spaces
+---
+{"key_value":{"key":"key with spaces","value":{"value":"value with spaces"}}}
+-----
+key = value  // inline comment
+---
+{"key_value":{"comment":"inline comment","key":"key","value":{"value":"value"}}}
+-----
+block {
+}
+---
+{"block":{"name":"block","nodes":[]}}
+-----
+block {}
+---
+{"block":{"name":"block","nodes":[]}}
+-----
+block {  // opening comment
+}  // closing comment
+---
+{"block":{"closing_comment":"closing comment","name":"block","nodes":[],"opening_comment":"opening comment"}}
+-----
+list = [a, b, c]
+---
+{"key_value":{"key":"list","value":{"list":{"content":[{"value":"a"},{"value":"b"},{"value":"c"}]}}}}
+-----
+list = [
+    a
+    b
+    c
+]
+---
+{"key_value":{"key":"list","value":{"list":{"content":[{"value":"a"},{"value":"b"},{"value":"c"}]}}}}
+-----
+multiline = `
+hello
+world
+`
+---
+{"key_value":{"key":"multiline","value":{"value":"hello\nworld"}}}
+-----
+key = value
+key = again
+---
+{"parse_error":{"column":1,"line":2,"message":"duplicate key \"key\""}}
+-----
+{
+}
+---
+{"parse_error":{"column":1,"line":1,"message":"unnamed blocks are not allowed"}}
+-----
+block{
+}
+---
+{"parse_error":{"column":1,"line":2,"message":"identifier \"block{\" without '=' or '{' (perhaps add a space before '{')"}}
+-----
+key= value
+---
+{"parse_error":{"column":1,"line":2,"message":"identifier \"key= value\" without '=' or '{' (perhaps add a space before '=')"}}
+-----
+key =value
+---
+{"parse_error":{"column":6,"line":1,"message":"space required after '='"}}
+-----
+nested block {
+    inner {
+        key = value
+    }
+}
+---
+{"block":{"name":"nested block","nodes":[{"block":{"name":"inner","nodes":[{"key_value":{"key":"key","value":{"value":"value"}}}]}}]}}
+-----
+"quoted block name" {
+}
+---
+{"block":{"name":"quoted block name","nodes":[]}}
+-----
+"quoted key" = "quoted value"
+---
+{"key_value":{"key":"quoted key","value":{"quoted":true,"value":"quoted value"}}}
+-----
+list = [a, b,]
+---
+{"key_value":{"key":"list","value":{"list":{"content":[{"value":"a"},{"value":"b"}]}}}}
+-----
+nested lists = [[a, b], [c, d]]
+---
+{"key_value":{"key":"nested lists","value":{"list":{"content":[{"list":{"content":[{"value":"a"},{"value":"b"}]}},{"list":{"content":[{"value":"c"},{"value":"d"}]}}]}}}}
+-----
+link = https://example.com/path?query=value
+---
+{"key_value":{"key":"link","value":{"value":"https://example.com/path?query=value"}}}
+-----
+list = [,a]
+---
+{"parse_error":{"column":9,"line":1,"message":"unexpected ',' at start of list"}}
+-----
+list = [a, ,b]
+---
+{"parse_error":{"column":12,"line":1,"message":"unexpected ',' after another ','"}}
+-----
+[v1] {
+    key = value
+}
+---
+{"versioned_block":{"block":{"name":"","nodes":[{"key_value":{"key":"key","value":{"value":"value"}}}]},"version":1}}
+-----
+"" {
+}
+---
+{"block":{"name":"","nodes":[]}}
+-----
+"" = empty key
+---
+{"key_value":{"key":"","value":{"value":"empty key"}}}
+-----
+"[v1]" = not a versioned block
+---
+{"key_value":{"key":"[v1]","value":{"value":"not a versioned block"}}}
+-----
+"[v1]" {
+    key = value
+}
+---
+{"block":{"name":"[v1]","nodes":[{"key_value":{"key":"key","value":{"value":"value"}}}]}}
+-----
+outer {
+    [v1] {
+        a = 1
+    }
+}
+[v2] {
+    b = 2
+}
+---
+{"parse_error":{"column":1,"line":6,"message":"only one versioned block number allowed per file (found v2 after v1)"}}
+-----
+list = [one two, three]
+---
+{"parse_error":{"column":17,"line":1,"message":"ambiguous list: element with spaces used with comma separator (quote the element or remove the comma)"}}
+-----
+mixed list = [
+    a, b
+    c
+    d, e, f
+]
+---
+{"key_value":{"key":"mixed list","value":{"list":{"content":[{"value":"a"},{"value":"b"},{"value":"c"},{"value":"d"},{"value":"e"},{"value":"f"}]}}}}
+-----
+link = https://example.com  // double slash in URL is not a comment
+---
+{"key_value":{"comment":"double slash in URL is not a comment","key":"link","value":{"value":"https://example.com"}}}
+-----
+link 2 = https://example.com/items[]=foo
+---
+{"key_value":{"key":"link 2","value":{"value":"https://example.com/items[]=foo"}}}
+-----
+link 3 = https://example.com/group/{id}
+---
+{"key_value":{"key":"link 3","value":{"value":"https://example.com/group/{id}"}}}
+-----
+link 4 = https://example.com/?query=
+---
+{"key_value":{"key":"link 4","value":{"value":"https://example.com/?query="}}}
+-----
+meta = "some value with { characters that need quotes }"
+---
+{"key_value":{"key":"meta","value":{"quoted":true,"value":"some value with { characters that need quotes }"}}}
+-----
+"key with = sign" = value
+---
+{"key_value":{"key":"key with = sign","value":{"value":"value"}}}
+-----
+"name with = sign" {
+    inner = 1
+}
+---
+{"block":{"name":"name with = sign","nodes":[{"key_value":{"key":"inner","value":{"value":"1"}}}]}}
+-----
+server {
+    host = primary.example.com
+}
+server {
+    host = backup.example.com
+}
+---
+{"block":{"name":"server","nodes":[{"key_value":{"key":"host","value":{"value":"primary.example.com"}}}]}}
+{"block":{"name":"server","nodes":[{"key_value":{"key":"host","value":{"value":"backup.example.com"}}}]}}
+-----
+empty list = []
+---
+{"key_value":{"key":"empty list","value":{"list":{"content":[]}}}}
+-----
+empty list 2 = [
+]
+---
+{"key_value":{"key":"empty list 2","value":{"list":{"content":[]}}}}
+-----
+quoted list = ["a", "b", "c"]
+---
+{"key_value":{"key":"quoted list","value":{"list":{"content":[{"quoted":true,"value":"a"},{"quoted":true,"value":"b"},{"quoted":true,"value":"c"}]}}}}
+-----
+list with comments = [
+    // first comment
+    a
+    b  // inline comment
+    // another comment
+    c
+]
+---
+{"key_value":{"key":"list with comments","value":{"list":{"content":[{"comment":"first comment"},{"value":"a"},{"value":"b"},{"comment":"another comment"},{"value":"c"}]}}}}
+-----
+server {
+    host = example.com
+    [v5] {
+        tls mode = strict
+    }
+}
+---
+{"block":{"name":"server","nodes":[{"key_value":{"key":"host","value":{"value":"example.com"}}},{"versioned_block":{"block":{"name":"","nodes":[{"key_value":{"key":"tls mode","value":{"value":"strict"}}}]},"version":5}}]}}
+-----
+`multiline as key` = value
+---
+{"parse_error":{"column":1,"line":1,"message":"multiline strings cannot be used as block names or keys"}}
+-----
+trailing comma list = [
+    a,
+    b,
+    c,
+]
+---
+{"key_value":{"key":"trailing comma list","value":{"list":{"content":[{"value":"a"},{"value":"b"},{"value":"c"}]}}}}
+-----
+multiline with backtick = ```
+contains a ` backtick
+```
+---
+{"key_value":{"key":"multiline with backtick","value":{"value":"contains a ` backtick"}}}
+-----
+knuth = `
+"Premature optimization is the root of all evil."
+— Donald Knuth
+`
+---
+{"key_value":{"key":"knuth","value":{"value":"\"Premature optimization is the root of all evil.\"\n— Donald Knuth"}}}
+-----
+value starting with slash = "//not a comment"
+---
+{"key_value":{"key":"value starting with slash","value":{"quoted":true,"value":"//not a comment"}}}
+-----
+value with leading space = " leading space"
+---
+{"key_value":{"key":"value with leading space","value":{"quoted":true,"value":" leading space"}}}
+-----
+value with trailing space = "trailing space "
+---
+{"key_value":{"key":"value with trailing space","value":{"quoted":true,"value":"trailing space "}}}
+-----
+value starting with bracket = "[not a list]"
+---
+{"key_value":{"key":"value starting with bracket","value":{"quoted":true,"value":"[not a list]"}}}
+-----
+value ending with bracket = "ends with]"
+---
+{"key_value":{"key":"value ending with bracket","value":{"quoted":true,"value":"ends with]"}}}
+-----
+value ending with comma = "ends with,"
+---
+{"key_value":{"key":"value ending with comma","value":{"quoted":true,"value":"ends with,"}}}
+-----
+value with space equals = "has = sign"
+---
+{"key_value":{"key":"value with space equals","value":{"quoted":true,"value":"has = sign"}}}
+-----
+value with space brace = "has { brace"
+---
+{"key_value":{"key":"value with space brace","value":{"quoted":true,"value":"has { brace"}}}
+-----
+multiline in list = [
+    `
+    line one
+    line two
+    `
+    other
+]
+---
+{"key_value":{"key":"multiline in list","value":{"list":{"content":[{"value":"line one\nline two"},{"value":"other"}]}}}}
+-----
+list with opening comment = [  // this is a list
+    a
+    b
+]
+---
+{"key_value":{"key":"list with opening comment","value":{"list":{"content":[{"comment":"this is a list"},{"value":"a"},{"value":"b"}]}}}}
+-----
+unicode key 你好 = unicode value 世界
+---
+{"key_value":{"key":"unicode key 你好","value":{"value":"unicode value 世界"}}}
+-----
+emoji = 🎉
+---
+{"key_value":{"key":"emoji","value":{"value":"🎉"}}}
+-----
+deeply nested {
+    level1 {
+        level2 {
+            level3 {
+                value = deep
+            }
+        }
+    }
+}
+---
+{"block":{"name":"deeply nested","nodes":[{"block":{"name":"level1","nodes":[{"block":{"name":"level2","nodes":[{"block":{"name":"level3","nodes":[{"key_value":{"key":"value","value":{"value":"deep"}}}]}}]}}]}}]}}
+-----
+duplicate in block {
+    key = first
+    key = second
+}
+---
+{"parse_error":{"column":5,"line":3,"message":"duplicate key \"key\""}}
+-----
+just equals =
+---
+{"parse_error":{"column":14,"line":1,"message":"missing value after '='"}}
+-----
+a = b = c
+---
+{"parse_error":{"column":8,"line":1,"message":"only one '=' assignment allowed per line"}}
+-----
+list closing comment = [a, b]  // closing
+---
+{"key_value":{"comment":"closing","key":"list closing comment","value":{"list":{"content":[{"value":"a"},{"value":"b"}]}}}}
+-----
+block with content after close {
+    key = value
+} extra
+---
+{"parse_error":{"column":3,"line":3,"message":"unexpected character 'e' after '}'"}}
+-----
+block with content after open { stuff
+}
+---
+{"parse_error":{"column":33,"line":1,"message":"expected newline or '}' after '{', got 's'"}}
+-----
+[v0] {
+    key = value
+}
+---
+{"versioned_block":{"block":{"name":"","nodes":[{"key_value":{"key":"key","value":{"value":"value"}}}]},"version":0}}
+-----
+[v999999] {
+    key = value
+}
+---
+{"versioned_block":{"block":{"name":"","nodes":[{"key_value":{"key":"key","value":{"value":"value"}}}]},"version":999999}}
+-----
+[vx] {
+}
+---
+{"parse_error":{"column":3,"line":1,"message":"invalid versioned block: expected version number after [v"}}
+-----
+[v-1] {
+}
+---
+{"parse_error":{"column":3,"line":1,"message":"invalid versioned block: expected version number after [v"}}
+-----
+[v1.5] {
+}
+---
+{"parse_error":{"column":4,"line":1,"message":"invalid versioned block: expected ']' after version number"}}
+-----
+key	=	value with tabs
+---
+{"key_value":{"key":"key","value":{"value":"value with tabs"}}}
+-----
+// just a comment
+// another comment
+---
+{"comment":"just a comment"}
+{"comment":"another comment"}
+-----
+whitespace before comma = [a ,b]
+---
+{"parse_error":{"column":31,"line":1,"message":"ambiguous list: element with spaces used with comma separator (quote the element or remove the comma)"}}
+-----
+nil value = nil
+---
+{"key_value":{"key":"nil value","value":{"value":"nil"}}}
+-----
+quoted nil = "nil"
+---
+{"key_value":{"key":"quoted nil","value":{"quoted":true,"value":"nil"}}}
+-----
+true false = true
+---
+{"key_value":{"key":"true false","value":{"value":"true"}}}
+-----
+numbers = 42
+---
+{"key_value":{"key":"numbers","value":{"value":"42"}}}
+-----
+float = 3.14
+---
+{"key_value":{"key":"float","value":{"value":"3.14"}}}
+-----
+semver = 1.0.0
+---
+{"key_value":{"key":"semver","value":{"value":"1.0.0"}}}
+-----
+date = 2026-01-20
+---
+{"key_value":{"key":"date","value":{"value":"2026-01-20"}}}
+-----
+[v9223372036854775807] {
+}
+---
+{"versioned_block":{"block":{"name":"","nodes":[]},"version":9223372036854775807}}
+-----
+[v9223372036854775808] {
+}
+---
+{"parse_error":{"column":22,"line":1,"message":"version number overflows int64: 9223372036854775808"}}
+-----
+[v99999999999999999999999999999] {
+}
+---
+{"parse_error":{"column":32,"line":1,"message":"version number overflows int64: 99999999999999999999999999999"}}
+-----
+multiline indentation = `
+    first line sets base
+      indented more
+    back to base
+`
+---
+{"key_value":{"key":"multiline indentation","value":{"value":"first line sets base\n  indented more\nback to base"}}}
+-----
+multiline regression = `
+    first line sets base
+  less indented
+`
+---
+{"parse_error":{"column":2,"line":4,"message":"line has less indentation than the first line of the multiline string"}}
+-----
+multiline with tabs = `
+	tab indented base
+		double tab
+	back to single tab
+`
+---
+{"key_value":{"key":"multiline with tabs","value":{"value":"tab indented base\n\tdouble tab\nback to single tab"}}}
+-----
+multiline mixed indent = `
+    space base (4 spaces)
+	tab line (counts as 4)
+`
+---
+{"key_value":{"key":"multiline mixed indent","value":{"value":"space base (4 spaces)\ntab line (counts as 4)"}}}
+-----
+multiline tab regression = `
+	tab base (4 spaces equiv)
+   only 3 spaces
+`
+---
+{"parse_error":{"column":2,"line":4,"message":"line has less indentation than the first line of the multiline string"}}
+-----
+multiline empty lines = `
+    first line
+
+    after empty line
+`
+---
+{"key_value":{"key":"multiline empty lines","value":{"value":"first line\n\nafter empty line"}}}
+-----
+multiline only whitespace lines = `
+    first line
+        
+    after whitespace-only line
+`
+---
+{"key_value":{"key":"multiline only whitespace lines","value":{"value":"first line\n\nafter whitespace-only line"}}}
+-----
+multiline deep indent = `
+        deeply indented base
+            even deeper
+        back to base
+    regression here
+`
+---
+{"parse_error":{"column":2,"line":6,"message":"line has less indentation than the first line of the multiline string"}}
+-----
+empty multiline = ``
+---
+{"key_value":{"key":"empty multiline","value":{"value":""}}}
+-----
+empty multiline 4 = ````
+---
+{"key_value":{"key":"empty multiline 4","value":{"value":""}}}
+-----
+empty multiline 6 = ``````
+---
+{"key_value":{"key":"empty multiline 6","value":{"value":""}}}
+-----
+multiline single line = `
+    just one line
+`
+---
+{"key_value":{"key":"multiline single line","value":{"value":"just one line"}}}
+-----
+multiline no indent first = `
+no indent on first line
+    this has indent
+`
+---
+{"key_value":{"key":"multiline no indent first","value":{"value":"no indent on first line\n    this has indent"}}}
+-----
+triple backtick multiline = ```
+contains a single ` backtick
+and also `` two backticks
+```
+---
+{"key_value":{"key":"triple backtick multiline","value":{"value":"contains a single ` backtick\nand also `` two backticks"}}}
+-----
+five backtick multiline = `````
+contains ` and `` and ``` and ````
+`````
+---
+{"key_value":{"key":"five backtick multiline","value":{"value":"contains ` and `` and ``` and ````"}}}
+-----
+multiline in list with backticks = [
+    ```
+    has ` backtick
+    ```
+    ``
+]
+---
+{"key_value":{"key":"multiline in list with backticks","value":{"list":{"content":[{"value":"has ` backtick"},{"value":""}]}}}}
+-----
+block missing close {
+    key = value
+---
+{"parse_error":{"column":1,"line":3,"message":"unexpected end of file, 1 unclosed block(s)"}}
+-----
+list missing close = [a, b, c
+---
+{"parse_error":{"column":0,"line":2,"message":"unexpected end of file, expected ']'"}}
+-----
+multiline missing close = `
+    content here
+---
+{"parse_error":{"column":1,"line":3,"message":"unterminated multiline string"}}
+-----
+nested blocks missing one close {
+    inner {
+        key = value
+    }
+---
+{"parse_error":{"column":1,"line":5,"message":"unexpected end of file, 1 unclosed block(s)"}}
+-----
+nested blocks missing two closes {
+    inner {
+        key = value
+---
+{"parse_error":{"column":1,"line":4,"message":"unexpected end of file, 2 unclosed block(s)"}}
+-----
+deeply nested missing middle close {
+    level1 {
+        level2 {
+            key = value
+        }
+    key2 = value2
+}
+---
+{"parse_error":{"column":1,"line":8,"message":"unexpected end of file, 1 unclosed block(s)"}}
+-----
+nested lists missing inner close = [[a, b, c]
+---
+{"parse_error":{"column":0,"line":2,"message":"unexpected end of file, expected ']'"}}
+-----
+nested lists missing outer close = [[a, b], [c, d]
+---
+{"parse_error":{"column":0,"line":2,"message":"unexpected end of file, expected ']'"}}
+-----
+nested lists missing both closes = [[a, b
+---
+{"parse_error":{"column":0,"line":2,"message":"unexpected end of file, expected ']'"}}
+-----
+list with unterminated multiline = [
+    `
+    content
+]
+---
+{"parse_error":{"column":1,"line":5,"message":"unterminated multiline string in list"}}
+-----
+block with unterminated list {
+    items = [a, b
+}
+---
+{"parse_error":{"column":0,"line":4,"message":"unexpected end of file, expected ']'"}}
+-----
+triple backtick unterminated = ```
+content with ` backtick
+``
+---
+{"parse_error":{"column":1,"line":4,"message":"unterminated multiline string"}}
+-----
+complex nested missing close {
+    users = [alice, bob]
+    config {
+        timeout = 30
+        nested {
+            deep = value
+}
+---
+{"parse_error":{"column":1,"line":8,"message":"unexpected end of file, 2 unclosed block(s)"}}
+-----
+block closes list early {
+    items = [a, b
+    }
+    other = value
+}
+---
+{"parse_error":{"column":0,"line":6,"message":"unexpected end of file, expected ']'"}}
+-----
+list in block missing list close {
+    items = [
+        a
+        b
+}
+---
+{"parse_error":{"column":0,"line":6,"message":"unexpected end of file, expected ']'"}}
+-----
+multiple blocks one unclosed {
+    first {
+        a = 1
+    }
+    second {
+        b = 2
+}
+---
+{"parse_error":{"column":1,"line":8,"message":"unexpected end of file, 1 unclosed block(s)"}}
+-----
+mixed nesting chaos {
+    list = [
+        inner {
+---
+{"parse_error":{"column":0,"line":4,"message":"unexpected end of file, expected ']'"}}
+-----

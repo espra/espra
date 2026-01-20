@@ -39,9 +39,9 @@ func TestParse(t *testing.T) {
 				t.Errorf("failed to marshal parse error: %v", jerr)
 				continue
 			}
-			got := buf.String()
+			got := strings.TrimSuffix(buf.String(), "\n")
 			if got != want {
-				t.Errorf("unexpected parse error for:\n\n%s\n---\n\ngot:\n\n%s\nwant:\n\n%s", src, got, want)
+				t.Errorf("unexpected parse error for:\n\n%s\n---\n\ngot:\n\n%s\n\nwant:\n\n%s\n\n", src, got, want)
 				continue
 			}
 			continue
@@ -50,9 +50,9 @@ func TestParse(t *testing.T) {
 		for _, node := range nodes {
 			enc.Encode(node)
 		}
-		got := buf.String()
+		got := strings.TrimSuffix(buf.String(), "\n")
 		if got != want {
-			t.Errorf("unexpected parsed result for:\n\n%s\n---\n\ngot:\n\n%s\nwant:\n\n%s", src, got, want)
+			t.Errorf("unexpected parsed result for:\n\n%s\n---\n\ngot:\n\n%s\n\nwant:\n\n%s\n\n", src, got, want)
 		}
 	}
 }
