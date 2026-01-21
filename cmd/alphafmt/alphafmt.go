@@ -419,6 +419,9 @@ func orderFileDecls(fset *token.FileSet, file *ast.File) []byte {
 		}
 	}
 
+	sort.SliceStable(constBlocks, func(i, j int) bool {
+		return firstDeclName(constBlocks[i]) < firstDeclName(constBlocks[j])
+	})
 	sort.SliceStable(constSingles, func(i, j int) bool {
 		return constSingles[i].name < constSingles[j].name
 	})
