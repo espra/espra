@@ -266,9 +266,9 @@ XON files are UTF-8 encoded:
 
 * Only ` ` (space) and `\t` (horizontal tab) are treated as whitespace.
 
-* Only `\n` (line feed) and `\r` (carriage return) are treated as newlines.
-
-* The sequence `\r\n` is treated as a single newline.
+* `\r\n` is normalized to `\n` before parsing, so both Unix and Windows line
+  endings are supported. Standalone `\r` has no special meaning and is treated
+  like any other character.
 
 ### Comments
 
@@ -355,7 +355,7 @@ Quoted strings are enclosed in `"`, e.g.
 key = "some value with { characters that need quotes }"
 ```
 
-Strings must be multiline if they contain `\n`, `\r`, or `"`, e.g.
+Strings must be multiline if they contain `\n`, `\r\n`, or `"`, e.g.
 
 ```xon
 knuth = `
@@ -366,9 +366,13 @@ knuth = `
 
 Multiline strings:
 
-* Begin and end with a matching number of backtick characters. For example, if
-  the string contains one backtick, you can enclose it in a multiline with two
-  backticks.
+* Begin and end with a matching odd number of backtick characters, e.g. 1, 3, 5,
+  etc. For example, if the string contains one backtick, you can enclose it in a
+  multiline with three backticks.
+
+* An even number of consecutive backticks is interpreted as half opening and
+  half closing, representing an empty string. For example, ` `` ` is an empty
+  multiline string (1 backtick to open, 1 to close).
 
 * Strip whitespace and/or newlines after the opening backtick sequence, and
   before the closing backtick sequence.
@@ -656,7 +660,8 @@ err := xon.DecodeVersion(data, cfg, 5)  // includes [v5] block
 
 Rules:
 
-* Versioned blocks use the syntax `[v<N>]` where `<N>` is a positive integer.
+* Versioned blocks use the syntax `[v<N>]` where `<N>` is a non-negative integer
+  up to 9,223,372,036,854,775,807 (max int64).
 
 * Versioned blocks can appear anywhere a regular block can, i.e. at the top
   level and at any nested depth.
