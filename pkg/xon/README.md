@@ -267,8 +267,7 @@ XON files are UTF-8 encoded:
 * Only ` ` (space) and `\t` (horizontal tab) are treated as whitespace.
 
 * `\r\n` is normalized to `\n` before parsing, so both Unix and Windows line
-  endings are supported. Standalone `\r` has no special meaning and is treated
-  like any other character.
+  endings are supported.
 
 ### Comments
 
@@ -318,36 +317,49 @@ Strings appear as:
 * Keys
 * Values, when the value is not a list or a block
 
+Strings can be made up of any byte sequence. But they must use `<|0xNN|>` byte
+escapes to represent:
+
+* `\r`
+* Invalid UTF-8 byte sequences
+
 Strings follow the same parsing rules in all contexts, and can be one of:
 
 * Unquoted
 * Quoted
 * Multiline
 
-Strings need to be quoted if they:
+Unquoted strings are automatically trimmed for whitespace, so spacing can be
+used to improve legibility, e.g.
 
-* Start with `//`.
+```xon
+  primary node = node-1.espra.com
+secondary node = node-2.espra.com
+```
 
-* Have leading or trailing whitespace.
-
-* Start with `[` or end with `]` or end with `,`.
-
-* Contain `//`, `=`, `{`, `}`, `[`, or `]` preceded by whitespace.
+Strings must be quoted if they:
 
 * Are empty.
 
-The rule requiring quoting only when certain characters are preceded by
-whitespace allows for things like URL values without needing quotes, e.g.
+* Have leading or trailing whitespace.
+
+* Contain any XON meta character sequence, i.e.
+
+  * Start with `[` or `//`.
+
+  * End with `]` or `,`.
+
+  * Contain `//`, `=`, `{`, `}`, `[`, or `]` preceded by whitespace.
+
+This lets us use values like URLs without having to quote them all the time,
+e.g.
 
 ```xon
-link = https://example.com
+link 1 = https://example.com
 link 2 = https://example.com/items[]=foo
 link 3 = https://example.com/group/{id}
-link 4 = https://example.com/?query=
+link 4 = https://example.com/?query=foo
 ```
-
-Unquoted strings are automatically trimmed for whitespace, so spacing can be
-used to improve legibility, add comments, etc.
 
 Quoted strings are enclosed in `"`, e.g.
 
@@ -355,7 +367,7 @@ Quoted strings are enclosed in `"`, e.g.
 key = "some value with { characters that need quotes }"
 ```
 
-Strings must be multiline if they contain `\n`, `\r\n`, or `"`, e.g.
+Strings must be multiline if they contain unescaped `\n` or `"` bytes, e.g.
 
 ```xon
 knuth = `
@@ -370,9 +382,8 @@ Multiline strings:
   etc. For example, if the string contains one backtick, you can enclose it in a
   multiline with three backticks.
 
-* An even number of consecutive backticks is interpreted as half opening and
-  half closing, representing an empty string. For example, ` `` ` is an empty
-  multiline string (1 backtick to open, 1 to close).
+* An even number of consecutive backticks is interpreted as an empty string,
+  e.g. ` `` `.
 
 * Strip whitespace and/or newlines after the opening backtick sequence, and
   before the closing backtick sequence.
@@ -420,13 +431,38 @@ Empty block names and keys are also fine:
 "" = value
 ```
 
-Strings cannot exist on a line on their own. They must either be a block name, a
-key, or a scalar value. Outside of lists, scalar values can only be followed by
-whitespace or an inline comment on the same line.
+Except when a string is a list element, it cannot appear on a line by itself and
+can only be followed by whitespace or an inline comment on the same line.
 
-Unlike programming languages, strings in XON do not support escape sequences
-like `\n`. To include special characters, just use them directly within
-multiline strings.
+### Byte Escapes
+
+Strings can contain byte escapes using the syntax `<|0xNN|>` where `NN`
+can be any two hex digits, i.e. `0-9`, `a-f`, or `A-F`. This is useful for
+representing:
+
+* `\r` or `\r\n` sequences that might otherwise get normalized.
+* Control characters that would not normally be visible.
+* Values with byte sequences that would not be valid UTF-8.
+
+```xon
+crlf = line1<|0x0D|><|0x0A|>line2
+^c = <|0x03|>
+quote = say <|0x22|>hello<|0x22|>
+```
+
+If the parser encounters `<|0x`, it must be followed by exactly two hex digits
+and `|>`, otherwise it is an error. The literal `<|0x` sequence can be embedded
+in a string, by escaping the opening `<`:
+
+```xon
+literal = "<|0x3C|>|0x0D|>"   // produces the literal: <|0x0D|>
+```
+
+Formatters must always use byte escapes for:
+
+* `\r`
+* All non-printable control characters except `\t`
+* Any byte sequence that would be invalid UTF-8
 
 ### Key/Value Pairs
 
