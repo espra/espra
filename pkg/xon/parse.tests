@@ -307,7 +307,7 @@ list with opening comment = [  // this is a list
     b
 ]
 ---
-{"key_value":{"key":"list with opening comment","value":{"list":{"content":[{"comment":"this is a list"},{"value":"a"},{"value":"b"}]}}}}
+{"key_value":{"key":"list with opening comment","value":{"list":{"content":[{"value":"a"},{"value":"b"}],"opening_comment":"this is a list"}}}}
 -----
 unicode key 你好 = unicode value 世界
 ---
@@ -661,4 +661,32 @@ mixed nesting chaos {
         inner {
 ---
 {"parse_error":{"column":0,"line":4,"message":"unexpected end of file, expected ']'"}}
+-----
+key = "<|0xGG|>"
+---
+{"parse_error":{"column":16,"line":1,"message":"invalid hex digit 'G' in byte escape sequence"}}
+-----
+key = "<|0xZZ|>"
+---
+{"parse_error":{"column":16,"line":1,"message":"invalid hex digit 'Z' in byte escape sequence"}}
+-----
+key = "<|0x0"
+---
+{"parse_error":{"column":13,"line":1,"message":"incomplete byte escape sequence at end of string"}}
+-----
+key = "<|0x0D"
+---
+{"parse_error":{"column":14,"line":1,"message":"incomplete byte escape sequence at end of string"}}
+-----
+key = "<|0xD|>"
+---
+{"parse_error":{"column":15,"line":1,"message":"incomplete byte escape sequence at end of string"}}
+-----
+key = "<|0x0D>>"
+---
+{"parse_error":{"column":16,"line":1,"message":"byte escape sequence missing closing |>"}}
+-----
+key = "<|0x0D||"
+---
+{"parse_error":{"column":16,"line":1,"message":"byte escape sequence missing closing |>"}}
 -----
