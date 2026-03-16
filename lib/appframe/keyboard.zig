@@ -1,6 +1,9 @@
+// Public Domain (-) 2026-present, The Espra Core Authors.
+// See the Espra Core UNLICENSE file for details.
+
 const std = @import("std");
 
-/// KeyEvent represents a keyboard event.
+/// A keyboard event.
 pub const KeyEvent = struct {
     action: Action,
     logical: LogicalKey,
@@ -14,12 +17,12 @@ pub const KeyEvent = struct {
     };
 };
 
-/// LogicalKey represents the layout-resolved meaning of a key.
+/// The layout-resolved meaning of a key.
 pub const LogicalKey = union(enum) {
     unidentified,
 
-    /// Codepoint holds the Unicode codepoint of the pressed key for
-    /// non-special keys, before applying modifier keys or lock keys.
+    /// The Unicode codepoint of the pressed key for non-special keys, before
+    /// any modifier keys or lock keys are applied.
     codepoint: u21,
 
     // Arrow Keys
@@ -112,6 +115,13 @@ pub const LogicalKey = union(enum) {
         };
     }
 
+    pub fn format(self: LogicalKey, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .codepoint => |cp| try writer.print("\"{u}\"", .{cp}),
+            else => try writer.writeAll(@tagName(self)),
+        }
+    }
+
     pub fn is_arrow_key(self: LogicalKey) bool {
         return switch (self) {
             .down, .left, .right, .up => true,
@@ -136,9 +146,13 @@ pub const LogicalKey = union(enum) {
             else => false,
         };
     }
+
+    pub fn is_space(self: LogicalKey) bool {
+        return self.char() == ' ';
+    }
 };
 
-/// ModifierState represents which modifier keys are in effect.
+/// The state of modifier keys.
 pub const ModifierState = packed struct(u8) {
     alt: bool = false,
     caps_lock: bool = false,
@@ -181,8 +195,8 @@ pub const ModifierState = packed struct(u8) {
     }
 };
 
-/// PhysicalKeyPosition represents the physical position of a key. It uses the
-/// corresponding location on a US QWERTY keyboard as the reference.
+/// The physical position of a key, based on the corresponding location on a US
+/// QWERTY keyboard as the reference point.
 pub const PhysicalKeyPosition = enum(u8) {
     unidentified,
 
