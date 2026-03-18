@@ -179,6 +179,8 @@ def process_timezones(out):
         if line.startswith("Z "):
             split = line.split()
             name = split[1]
+            if name == "Factory":
+                continue
             if name in timezones:
                 exit(f"Found duplicate timezone {json.dumps(name)} in the tzdata file")
             if name == "Etc/UTC":
@@ -254,12 +256,15 @@ def process_timezones(out):
         out("    .{")
         out(f'        .name = "{name}",')
         out(f"        .mapping = .{mapping},")
-        out("        .overrides = &.{")
-        for region, mapping in sorted(entry["regional"].items()):
-            if mapping != "UTC":
-                mapping = f'@"{mapping}"'
-            out(f"            .{{ .region = .{region}, .mapping = .{mapping} }},")
-        out("        },")
+        if len(entry["regional"]) > 0:
+            out("        .overrides = &.{")
+            for region, mapping in sorted(entry["regional"].items()):
+                if mapping != "UTC":
+                    mapping = f'@"{mapping}"'
+                out(f"            .{{ .region = .{region}, .mapping = .{mapping} }},")
+            out("        },")
+        else:
+            out("        .overrides = &.{},")
         out("    },")
     out("};")
     out("")
@@ -295,7 +300,6 @@ def process_timezones(out):
     out("        }")
     out("        return null;")
     out("    }")
-    out("")
     out("};\n")
 
     print(f"\n.. Found {len(languages)} languages, {len(regions)} regions, and {len(scripts)} scripts")
