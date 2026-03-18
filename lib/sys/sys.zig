@@ -4,12 +4,16 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const locale_info = @import("locale_info.zig");
 
-/// A two-letter ISO 639-1 language code.
+/// A BCP 47 language subtag for frequently seen languages.
+///
+/// Uses ISO 639-1 two-letter codes where available, and ISO 639-2 three-letter
+/// codes otherwise.
 pub const Language = locale_info.Language;
 
-/// A two-letter ISO 3166-1 country code.
+/// A two-letter ISO 3166-1 country code or the special "001" world region.
 pub const Region = locale_info.Region;
 
 /// A four-letter ISO 15924 script code.
@@ -28,16 +32,21 @@ pub const is_windows = builtin.os.tag == .windows;
 
 const c = if (is_linux)
     @cImport(@cInclude("locale.h"))
-else if (is_macos or is_ios)
+else if (is_macos)
     @cImport({
-        @cInclude("locale.h");
         @cInclude("sysdir.h");
     })
 else
     undefined;
 
+const objc = if (is_macos or is_ios) struct {
+    extern "objc" fn objc_getClass(name: [*:0]const u8) callconv(.c) ?*anyopaque;
+    extern "objc" fn objc_msgSend() callconv(.c) void;
+    extern "objc" fn sel_registerName(name: [*:0]const u8) callconv(.c) ?*anyopaque;
+} else undefined;
+
 // NOTE(tav): This needs the appframe module to be linked.
-const platform = if (is_android) struct {
+const platform = if (is_android or is_ios) struct {
     extern fn afplatform_app_path(*PlatformAppPath) callconv(.c) bool;
     extern fn afplatform_home_dir([*]u8, usize) callconv(.c) isize;
     extern fn afplatform_locale([*]u8, usize) callconv(.c) isize;
@@ -46,7 +55,19 @@ const platform = if (is_android) struct {
 } else undefined;
 
 const windows = if (is_windows) struct {
+    const BOOLEAN = u8;
     const DWORD = u32;
+    const DYNAMIC_TIME_ZONE_INFORMATION = extern struct {
+        Bias: LONG,
+        StandardName: [32]WCHAR,
+        StandardDate: SYSTEMTIME,
+        StandardBias: LONG,
+        DaylightName: [32]WCHAR,
+        DaylightDate: SYSTEMTIME,
+        DaylightBias: LONG,
+        TimeZoneKeyName: [128]WCHAR,
+        DynamicDaylightTimeDisabled: BOOLEAN,
+    };
     const GUID = extern struct {
         Data1: u32,
         Data2: u16,
@@ -55,6 +76,18 @@ const windows = if (is_windows) struct {
     };
     const HANDLE = std.os.windows.HANDLE;
     const HRESULT = i32;
+    const SYSTEMTIME = extern struct {
+        wYear: WORD,
+        wMonth: WORD,
+        wDayOfWeek: WORD,
+        wHour: WORD,
+        wMinute: WORD,
+        wSecond: WORD,
+        wMilliseconds: WORD,
+    };
+    const LONG = i32;
+    const WCHAR = u16;
+    const WORD = u16;
 
     const FOLDERID_LocalAppData = GUID{
         .Data1 = 0xF1B32785,
@@ -72,7 +105,9 @@ const windows = if (is_windows) struct {
 
     const S_OK: HRESULT = 0;
 
+    extern "kernel32" fn GetDynamicTimeZoneInformation(pTimeZoneInformation: *DYNAMIC_TIME_ZONE_INFORMATION) callconv(.winapi) DWORD;
     extern "kernel32" fn GetEnvironmentVariableW(lpName: [*:0]const u16, lpBuffer: ?[*]u16, nSize: DWORD) callconv(.winapi) DWORD;
+    extern "kernel32" fn GetUserDefaultLocaleName(lpLocaleName: [*]u16, cchLocaleName: c_int) callconv(.winapi) c_int;
     extern "kernel32" fn GetWindowsDirectoryW(lpBuffer: [*]u16, uSize: DWORD) callconv(.winapi) DWORD;
     extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
     extern "shell32" fn SHGetKnownFolderPath(rfid: *const GUID, dwFlags: DWORD, hToken: ?HANDLE, ppszPath: *[*:0]u16) callconv(.winapi) HRESULT;
@@ -120,20 +155,22 @@ pub const AppPathStrategy = enum {
     prefer_xdg,
 };
 
-/// A locale composed of language, region, and script identifiers.
+/// A BCP 47 locale composed of language, region, and script identifiers.
 pub const Locale = struct {
     language: Language,
-    region: Region,
-    script: Script,
+    region: ?Region,
+    script: ?Script,
 
     pub fn format(self: Locale, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try self.language.format(writer);
-        try writer.writeByte('-');
-        if (self.script != .unspecified) {
-            try self.script.format(writer);
+        try writer.writeAll(@tagName(self.language));
+        if (self.script) |s| {
             try writer.writeByte('-');
+            try writer.writeAll(@tagName(s));
         }
-        try self.region.format(writer);
+        if (self.region) |r| {
+            try writer.writeByte('-');
+            try writer.writeAll(@tagName(r));
+        }
     }
 };
 
@@ -262,8 +299,62 @@ pub fn home_dir(allocator: Allocator) !?[]const u8 {
 }
 
 /// Find the locale information for the current user.
+///
+/// Defaults to English if the language cannot be determined.
 pub fn locale() Locale {
-    return Locale{};
+    if (is_android) {
+        var buf: [64]u8 = undefined;
+        const len = platform.afplatform_locale(&buf, buf.len);
+        if (len > 0) {
+            if (parse_bcp47_locale(buf[0..@intCast(len)])) |val| {
+                return val;
+            }
+        }
+        return Locale{
+            .language = .en,
+            .region = null,
+            .script = null,
+        };
+    }
+    switch (builtin.os.tag) {
+        .linux => {
+            if (locale_from_env()) |val| {
+                return val;
+            }
+        },
+        .macos => {
+            if (locale_from_env()) |val| {
+                return val;
+            }
+            if (nslocale()) |val| {
+                return val;
+            }
+        },
+        .ios => {
+            if (nslocale()) |val| {
+                return val;
+            }
+        },
+        .windows => {
+            var buf16: [85]u16 = undefined;
+            const len = windows.GetUserDefaultLocaleName(&buf16, buf16.len);
+            if (len > 0) {
+                var buf: [256]u8 = undefined;
+                const n = std.unicode.utf16LeToUtf8(&buf, buf16[0..@intCast(len - 1)]) catch 0;
+                if (n > 0) {
+                    if (parse_bcp47_locale(buf[0..n])) |val| {
+                        return val;
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+    return Locale{
+        .language = .en,
+        .region = null,
+        .script = null,
+    };
 }
 
 /// Find the temp directory for the current user.
@@ -299,8 +390,8 @@ pub fn temp_dir(allocator: Allocator) ![]const u8 {
         }
         return try std.unicode.utf16LeToUtf8Alloc(allocator, buf[0..len]);
     }
-    inline for ([_][*:0]const u8{ "TMPDIR", "TMP", "TEMP" }) |key| {
-        if (std.c.getenv(key)) |tmp| {
+    inline for ([_][*:0]const u8{ "TMPDIR", "TMP", "TEMP" }) |env| {
+        if (std.c.getenv(env)) |tmp| {
             return try allocator.dupe(u8, std.mem.span(tmp));
         }
     }
@@ -308,8 +399,39 @@ pub fn temp_dir(allocator: Allocator) ![]const u8 {
 }
 
 /// Get the current system timezone.
-pub fn timezone() Timezone {
-    return Timezone{};
+///
+/// Defaults to UTC if a known timezone cannot be determined.
+///
+/// If a region is provided, then on Windows, it will try and match the Windows
+/// timezone to the region-appropriate IANA timezone.
+pub fn timezone(io: Io, region: ?Region) Timezone {
+    if (is_android or is_ios) {
+        var buf: [64]u8 = undefined;
+        const len = platform.afplatform_timezone(&buf, buf.len);
+        if (len > 0) {
+            return Timezone.parse(buf[0..@intCast(len)]) orelse .UTC;
+        }
+        return .UTC;
+    }
+    switch (builtin.os.tag) {
+        .linux => {
+            return timezone_from_env() orelse timezone_from_etc_timezone(io) orelse timezone_from_etc_localtime(io) orelse .UTC;
+        },
+        .macos => {
+            return timezone_from_env() orelse timezone_from_etc_localtime(io) orelse .UTC;
+        },
+        .windows => {
+            var info: windows.DYNAMIC_TIME_ZONE_INFORMATION = undefined;
+            _ = windows.GetDynamicTimeZoneInformation(&info);
+            const tz16 = std.mem.sliceTo(&info.TimeZoneKeyName, 0);
+            var tz_buf: [64]u8 = undefined;
+            const len = std.unicode.utf16LeToUtf8(&tz_buf, tz16) catch return .UTC;
+            return Timezone.from_windows_name(tz_buf[0..len], region) orelse .UTC;
+        },
+        else => {
+            return .UTC;
+        },
+    }
 }
 
 fn ios_app_path(allocator: Allocator) !?AppPath {
@@ -322,6 +444,36 @@ fn ios_app_path(allocator: Allocator) !?AppPath {
         .runtime_dir = try std.fs.path.join(allocator, &.{ home, "Library", "Application Support", "runtime" }),
         .state_dir = try std.fs.path.join(allocator, &.{ home, "Library", "Application Support", "state" }),
     };
+}
+
+fn is_all_digits(s: []const u8) bool {
+    for (s) |ch| {
+        if (ch < '0' or ch > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn is_all_upper(s: []const u8) bool {
+    for (s) |ch| {
+        if (ch < 'A' or ch > 'Z') {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn locale_from_env() ?Locale {
+    inline for (.{ "LC_ALL", "LC_MESSAGES", "LANG" }) |env| {
+        if (std.c.getenv(env)) |env_z| {
+            const val = std.mem.span(env_z);
+            if (val.len > 0) {
+                return parse_posix_locale(val);
+            }
+        }
+    }
+    return null;
 }
 
 fn macos_app_path(allocator: Allocator, id: []const u8) !?AppPath {
@@ -338,6 +490,86 @@ fn macos_app_path(allocator: Allocator, id: []const u8) !?AppPath {
     };
 }
 
+fn nslocale() ?Locale {
+    const NSLocale: *anyopaque = @ptrCast(objc.objc_getClass("NSLocale") orelse return null);
+    const currentLocale: *anyopaque = @ptrCast(objc.sel_registerName("currentLocale") orelse return null);
+    const localeIdentifier: *anyopaque = @ptrCast(objc.sel_registerName("localeIdentifier") orelse return null);
+    const UTF8String: *anyopaque = @ptrCast(objc.sel_registerName("UTF8String") orelse return null);
+    const send: *const fn (*anyopaque, *anyopaque) callconv(.c) ?*anyopaque = @ptrCast(&objc.objc_msgSend);
+    const loc = send(NSLocale, currentLocale) orelse return null;
+    const ident = send(loc, localeIdentifier) orelse return null;
+    const cstr: [*:0]const u8 = @ptrCast(send(ident, UTF8String) orelse return null);
+    const str = std.mem.span(cstr);
+    if (str.len > 64) {
+        return null;
+    }
+    var buf: [64]u8 = undefined;
+    @memcpy(buf[0..str.len], str);
+    std.mem.replaceScalar(u8, buf[0..str.len], '_', '-');
+    return parse_bcp47_locale(buf[0..str.len]);
+}
+
+fn parse_bcp47_locale(val: []const u8) ?Locale {
+    var parts = std.mem.splitScalar(u8, val, '-');
+    var language: ?Language = null;
+    var region: ?Region = null;
+    var script: ?Script = null;
+    while (parts.next()) |part| {
+        if (part.len == 4) {
+            if (Script.parse(part)) |s| {
+                script = s;
+            }
+        }
+        if (is_all_upper(part) or is_all_digits(part)) {
+            if (Region.parse(part)) |r| {
+                region = r;
+            }
+        }
+        if (Language.parse(part)) |l| {
+            language = l;
+        }
+    }
+    if (language == null and region == null and script == null) {
+        return null;
+    }
+    return Locale{
+        .language = language orelse .en,
+        .region = region,
+        .script = script,
+    };
+}
+
+fn parse_posix_locale(val: []const u8) ?Locale {
+    var base = val;
+    if (std.mem.indexOfScalar(u8, base, '@')) |idx| {
+        base = base[0..idx];
+    }
+    if (std.mem.indexOfScalar(u8, base, '.')) |idx| {
+        base = base[0..idx];
+    }
+    var language: ?Language = null;
+    var region: ?Region = null;
+    var parts = std.mem.splitScalar(u8, base, '_');
+    while (parts.next()) |part| {
+        if (is_all_upper(part) or is_all_digits(part)) {
+            if (Region.parse(part)) |r| {
+                region = r;
+            }
+        }
+        if (Language.parse(part)) |l| {
+            language = l;
+        }
+    }
+    if (language == null and region == null) {
+        return null;
+    }
+    return Locale{
+        .language = language orelse .en,
+        .region = region,
+        .script = null,
+    };
+}
+
 fn sysdir_path(allocator: Allocator, dir: c_uint) ![]const u8 {
     var buf: [4096]u8 = undefined;
     var state = c.sysdir_start_search_path_enumeration(dir, c.SYSDIR_DOMAIN_MASK_USER);
@@ -351,6 +583,42 @@ fn sysdir_path(allocator: Allocator, dir: c_uint) ![]const u8 {
         return try std.fs.path.join(allocator, &.{ std.mem.span(home), raw[1..] });
     }
     return try allocator.dupe(u8, raw);
+}
+
+fn timezone_from_env() ?Timezone {
+    const tz = std.c.getenv("TZ");
+    if (tz) |env_z| {
+        var env = std.mem.span(env_z);
+        if (env.len > 0) {
+            if (env[0] == ':') {
+                env = env[1..];
+            }
+            return Timezone.parse(env);
+        }
+    }
+    return null;
+}
+
+fn timezone_from_etc_localtime(io: Io) ?Timezone {
+    var buf: [4096]u8 = undefined;
+    const len = std.Io.Dir.readLinkAbsolute(io, "/etc/localtime", &buf) catch return null;
+    const symlink = buf[0..len];
+    if (std.mem.indexOf(u8, symlink, "zoneinfo/")) |idx| {
+        return Timezone.parse(symlink[idx + 9 ..]);
+    }
+    return null;
+}
+
+fn timezone_from_etc_timezone(io: Io) ?Timezone {
+    const file = std.Io.Dir.openFileAbsolute(io, "/etc/timezone", .{}) catch return null;
+    defer file.close(io);
+    var buf: [64]u8 = undefined;
+    const n = file.readPositionalAll(io, &buf, 0) catch return null;
+    const contents = buf[0..n];
+    if (std.mem.indexOfScalar(u8, contents, '\n')) |idx| {
+        return Timezone.parse(contents[0..idx]);
+    }
+    return Timezone.parse(contents);
 }
 
 fn windows_app_path(allocator: Allocator, publisher: ?[]const u8, windows_name: []const u8) !?AppPath {
@@ -411,28 +679,4 @@ fn xdg_dir(allocator: Allocator, unix_name: []const u8, env_name: []const u8, fa
         break :blk try std.fs.path.join(allocator, fallback);
     };
     return dir;
-}
-
-pub fn main() !void {
-    const allocator = std.heap.page_allocator;
-    const home = try home_dir(allocator) orelse "";
-    std.debug.print("Home: {s}\n", .{home});
-    const temp = try temp_dir(allocator);
-    std.debug.print("Temp: {s}\n", .{temp});
-    const path = try app_path(allocator, AppID{
-        .reverse_dns = "com.example.app",
-        .unix_name = "example",
-        .windows_name = "Example",
-        .publisher = "Publisher",
-    }, .native);
-    if (path) |xdg| {
-        // _ = xdg;
-        std.debug.print("Cache: {s}\n", .{xdg.cache_dir});
-        std.debug.print("Config: {s}\n", .{xdg.config_dir});
-        std.debug.print("Data: {s}\n", .{xdg.data_dir});
-        std.debug.print("Runtime: {s}\n", .{xdg.runtime_dir});
-        std.debug.print("State: {s}\n", .{xdg.state_dir});
-    }
-    // const Foox: Foo = .@"Europe/London";
-    // std.debug.print("Foo: {s}\n", .{@tagName(Foox)});
 }
