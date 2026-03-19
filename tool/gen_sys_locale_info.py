@@ -224,7 +224,6 @@ def process_timezones(out):
     out("")
     out("pub const Timezone = enum {")
     out("    UTC,")
-    out("    Local,")
     for name in sorted(timezones):
         if name == "UTC":
             continue

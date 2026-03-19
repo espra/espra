@@ -1816,7 +1816,6 @@ const windows_timezones = [_]WindowsTimezone{
 
 pub const Timezone = enum {
     UTC,
-    Local,
     @"Africa/Abidjan",
     @"Africa/Algiers",
     @"Africa/Bissau",
