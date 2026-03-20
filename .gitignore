@@ -8,6 +8,11 @@
 
 build/
 
+# Generated files
+
+lib/sys/locale_info.zig
+lib/time/tzdata.zig
+
 # Temporary files
 
 *.tmp
