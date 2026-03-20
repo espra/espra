@@ -89,7 +89,7 @@ def process_iso_3166_1():
 
 
 def process_languages(out):
-    out("pub const Language = enum {")
+    out("pub const Language = enum(u16) {")
     for code in sorted(languages):
         if code == "or":
             out('    @"or",')
@@ -103,7 +103,7 @@ def process_languages(out):
 
 
 def process_regions(out):
-    out("pub const Region = enum {")
+    out("pub const Region = enum(u16) {")
     for code in sorted(regions):
         if code == "001":
             out('    @"001",')
@@ -117,7 +117,7 @@ def process_regions(out):
 
 
 def process_scripts(out):
-    out("pub const Script = enum {")
+    out("pub const Script = enum(u8) {")
     for code in sorted(scripts):
         out(f"    {code},")
     out("")
@@ -222,7 +222,7 @@ def process_timezones(out):
         out("    },")
     out("};")
     out("")
-    out("pub const Timezone = enum {")
+    out("pub const Timezone = enum(u16) {")
     out("    UTC,")
     for name in sorted(timezones):
         if name == "UTC":
