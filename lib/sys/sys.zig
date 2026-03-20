@@ -3,9 +3,10 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const locale_info = @import("locale_info.zig");
+
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const locale_info = @import("locale_info.zig");
 
 /// A BCP 47 language subtag for frequently seen languages.
 ///
@@ -144,6 +145,14 @@ pub const AppPath = struct {
     /// storing persisted state that would normally not be backed up, such as
     /// session state and log files.
     state_dir: []const u8,
+
+    pub fn deinit(self: AppPath, allocator: Allocator) void {
+        allocator.free(self.cache_dir);
+        allocator.free(self.config_dir);
+        allocator.free(self.data_dir);
+        allocator.free(self.runtime_dir);
+        allocator.free(self.state_dir);
+    }
 };
 
 /// The strategy to use for constructing app paths.
