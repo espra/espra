@@ -1,0 +1,14 @@
+// Public Domain (-) 2026-present, The Espra Core Authors.
+// See the Espra Core UNLICENSE file for details.
+
+.{
+    .fingerprint = 0x9d3722b8a7729130,
+    .minimum_zig_version = "0.16.0-dev",
+    .name = .espra,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "lib",
+    },
+    .version = "0.0.1",
+}
