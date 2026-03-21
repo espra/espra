@@ -92,6 +92,27 @@ pub fn build(b: *std.Build) void {
     // Install executables
     b.installArtifact(scaffold_exe);
 
+    // Add tests
+    const test_step = b.step("test", "Run tests");
+    const test_files = .{
+        .{ "lib/time/time.zig", .{.{ "sys", sys_mod }} },
+    };
+
+    inline for (test_files) |entry| {
+        const m = b.createModule(.{
+            .root_source_file = b.path(entry[0]),
+            .target = target,
+            .optimize = optimize,
+        });
+        inline for (entry[1]) |imp| {
+            m.addImport(imp[0], imp[1]);
+        }
+        const t = b.addTest(.{ .root_module = m });
+        t.step.dependOn(&make.step);
+        t.filters = b.args orelse &.{};
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
     // Define custom steps
     const run_cmd = b.addRunArtifact(scaffold_exe);
     run_cmd.step.dependOn(b.getInstallStep());
