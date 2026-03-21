@@ -85,7 +85,6 @@ Update lines: <utc_offset> <dst_rule> <extra_info> [<end_year> [<end_month> [<en
 import json
 
 from common import DEBUG, exit, fetch, write_file, zig_file
-from datetime import datetime
 
 BUILD_DIR = "build/sys_locale_info"
 OUTPUT_FILE = "lib/time/tzdata.zig"
@@ -94,7 +93,10 @@ TZDATA = "https://data.iana.org/time-zones/tzdb/tzdata.zi"
 
 MINUTE = 60
 HOUR = 3600
-NOW_YEAR = datetime.now().year
+
+# NOTE(tav): Our tests are linked to this value. So, if we update this value,
+# e.g. to minimize historic data, we'd need to update the tests too.
+NOW_YEAR = 2025
 
 WEEKDAY_ENUM = {
     0: "sunday",
@@ -441,9 +443,17 @@ def prune_tzdata(ori_rules, ori_timezones):
             rules[rule_id] = ("oscillating", active)
         elif count > 2:
             rules[rule_id] = ("continuous", active)
+            offsets = set()
             for rule in active:
                 if rule["time"][1] != "wall":
                     exit(f"Unexpected transition of {json.dumps(rule['time'][1])} time for continuous rule {json.dumps(rule_id)}")
+                if rule["offset"]:
+                    offsets.add(rule["offset"])
+            # NOTE(tav): If this constraint ever gets violated, we'd need to
+            # update the manner in which we calculate the DST offset inside
+            # DateTime.utc() to handle multiple offsets.
+            if len(offsets) != 1:
+                exit(f"Found multiple offset values for continuous rule {json.dumps(rule_id)}: {offsets}")
         elif count == 0:
             dead_rules.add(rule_id)
         else:
