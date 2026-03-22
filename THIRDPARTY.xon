@@ -1,0 +1,14 @@
+// This file identifies third-party code included in Espra Core ("The Work")
+// along with the location of their respective copyright and license terms.
+
+xxhash {
+    files = [
+        dep/xxhash/*
+    ]
+    sources = [
+        https://github.com/Cyan4973/xxHash/tree/82cead715cbfddd9e6093db8df95155077ce6e64
+    ]
+    terms = [
+        dep/xxhash/LICENSE
+    ]
+}
