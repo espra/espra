@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("lib/xxh3/xxh3.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     // Create executables
