@@ -2,20 +2,19 @@
 // See the Espra Core UNLICENSE file for details.
 
 const xxhash = struct {
-    const XXH128_hash_t = extern struct {
-        low64: u64,
-        high64: u64,
-    };
-
     extern fn XXH3_64bits(input: ?[*]const u8, length: usize) u64;
     extern fn XXH3_64bits_withSeed(input: ?[*]const u8, length: usize, seed: u64) u64;
-    extern fn XXH3_128bits(input: ?[*]const u8, length: usize) XXH128_hash_t;
-    extern fn XXH3_128bits_withSeed(input: ?[*]const u8, length: usize, seed: u64) XXH128_hash_t;
+    extern fn XXH3_128bits(input: ?[*]const u8, length: usize) Hash128;
+    extern fn XXH3_128bits_withSeed(input: ?[*]const u8, length: usize, seed: u64) Hash128;
 };
 
-pub const Hash128 = struct {
+pub const Hash128 = extern struct {
     low: u64,
     high: u64,
+
+    pub fn equal(self: Hash128, other: Hash128) bool {
+        return self.low == other.low and self.high == other.high;
+    }
 };
 
 pub fn hash64(data: []const u8) u64 {
@@ -27,19 +26,11 @@ pub fn hash64_with_seed(data: []const u8, seed: u64) u64 {
 }
 
 pub fn hash128(data: []const u8) Hash128 {
-    const d = xxhash.XXH3_128bits(data.ptr, data.len);
-    return Hash128{
-        .low = d.low64,
-        .high = d.high64,
-    };
+    return xxhash.XXH3_128bits(data.ptr, data.len);
 }
 
 pub fn hash128_with_seed(data: []const u8, seed: u64) Hash128 {
-    const d = xxhash.XXH3_128bits_withSeed(data.ptr, data.len, seed);
-    return Hash128{
-        .low = d.low64,
-        .high = d.high64,
-    };
+    return xxhash.XXH3_128bits_withSeed(data.ptr, data.len, seed);
 }
 
 const std = @import("std");
