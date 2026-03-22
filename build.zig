@@ -54,6 +54,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const xxh3_mod = b.addModule("xxh3", .{
+        .root_source_file = b.path("lib/xxh3/xxh3.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Create executables
     const scaffold_exe = b.addExecutable(.{
         .name = "scaffold",
@@ -82,8 +88,17 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    xxh3_mod.addIncludePath(b.path("dep/xxhash"));
+    xxh3_mod.addCSourceFile(.{
+        .file = b.path("dep/xxhash/xxhash.c"),
+        .flags = &.{
+            "-DXXH_CPU_LITTLE_ENDIAN=1",
+        },
+    });
+
     // Add module imports
     time_mod.addImport("sys", sys_mod);
+    time_mod.addImport("xxh3", xxh3_mod);
 
     // Add executable imports
     scaffold_exe.root_module.addImport("sys", sys_mod);
@@ -95,22 +110,17 @@ pub fn build(b: *std.Build) void {
     // Add tests
     const test_step = b.step("test", "Run tests");
     const test_files = .{
-        .{ "lib/time/time.zig", .{.{ "sys", sys_mod }} },
+        .{ "time", time_mod },
+        .{ "xxh3", xxh3_mod },
     };
-
     inline for (test_files) |entry| {
-        const m = b.createModule(.{
-            .root_source_file = b.path(entry[0]),
-            .target = target,
-            .optimize = optimize,
-        });
-        inline for (entry[1]) |imp| {
-            m.addImport(imp[0], imp[1]);
-        }
-        const t = b.addTest(.{ .root_module = m });
+        const t = b.addTest(.{ .root_module = entry[1] });
         t.step.dependOn(&make.step);
         t.filters = b.args orelse &.{};
-        test_step.dependOn(&b.addRunArtifact(t).step);
+        const run = b.addRunArtifact(t);
+        test_step.dependOn(&run.step);
+        const mod_test_step = b.step("test-" ++ entry[0], "Run " ++ entry[0] ++ " tests");
+        mod_test_step.dependOn(&run.step);
     }
 
     // Define custom steps
