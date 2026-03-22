@@ -23,7 +23,9 @@ scripts = set()
 skipped_regions = set()
 timezones = set()
 
-# NOTE(Tav): We swap UTC and Etc/UTC around as it's the most common timezone.
+# NOTE(tav): IANA considers Etc/UTC as the official timezone and UTC as just an
+# alias. We swap this around so that users can use just .UTC instead of having
+# to write .@"Etc/UTC" everywhere.
 tz_aliases = {}
 
 
