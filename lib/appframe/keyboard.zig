@@ -395,3 +395,227 @@ pub const PhysicalKeyPosition = enum(u8) {
         };
     }
 };
+
+pub const Shortcut = extern struct {
+    key: ShortcutKey,
+    modifiers: ShortcutModifiers,
+
+    pub fn match(self: Shortcut, event: KeyEvent) bool {
+        if (event.action != .pressed) {
+            return false;
+        }
+        const key = ShortcutKey.from_logical(event.logical) orelse return false;
+        return key == self.key and
+            event.modifers.alt == self.modifiers.alt and
+            event.modifers.control == self.modifiers.control and
+            event.modifers.meta == self.modifiers.meta and
+            event.modifers.shift == self.modifiers.shift;
+    }
+};
+
+pub const ShortcutKey = enum(u8) {
+    // Letters
+    a,
+    b,
+    c,
+    d,
+    e,
+    f,
+    g,
+    h,
+    i,
+    j,
+    k,
+    l,
+    m,
+    n,
+    o,
+    p,
+    q,
+    r,
+    s,
+    t,
+    u,
+    v,
+    w,
+    x,
+    y,
+    z,
+
+    // Digits
+    digit_0,
+    digit_1,
+    digit_2,
+    digit_3,
+    digit_4,
+    digit_5,
+    digit_6,
+    digit_7,
+    digit_8,
+    digit_9,
+
+    // Arrow Keys
+    down,
+    left,
+    right,
+    up,
+
+    // Nav Keys
+    end,
+    home,
+    page_down,
+    page_up,
+
+    // Editing
+    backspace,
+    delete,
+    enter,
+    insert,
+    space,
+    tab,
+
+    // Symbols
+    apostrophe,
+    backslash,
+    backtick,
+    bracket_left,
+    bracket_right,
+    comma,
+    equal,
+    minus,
+    period,
+    semicolon,
+    slash,
+
+    // Function Keys
+    f1,
+    f2,
+    f3,
+    f4,
+    f5,
+    f6,
+    f7,
+    f8,
+    f9,
+    f10,
+    f11,
+    f12,
+    f13,
+    f14,
+    f15,
+    f16,
+    f17,
+    f18,
+    f19,
+    f20,
+    f21,
+    f22,
+    f23,
+    f24,
+
+    // System Keys
+    escape,
+
+    pub fn from_logical_key(key: LogicalKey) ?ShortcutKey {
+        return switch (key) {
+            .codepoint => |cp| switch (cp) {
+                'a' => .a,
+                'b' => .b,
+                'c' => .c,
+                'd' => .d,
+                'e' => .e,
+                'f' => .f,
+                'g' => .g,
+                'h' => .h,
+                'i' => .i,
+                'j' => .j,
+                'k' => .k,
+                'l' => .l,
+                'm' => .m,
+                'n' => .n,
+                'o' => .o,
+                'p' => .p,
+                'q' => .q,
+                'r' => .r,
+                's' => .s,
+                't' => .t,
+                'u' => .u,
+                'v' => .v,
+                'w' => .w,
+                'x' => .x,
+                'y' => .y,
+                'z' => .z,
+                '0' => .digit_0,
+                '1' => .digit_1,
+                '2' => .digit_2,
+                '3' => .digit_3,
+                '4' => .digit_4,
+                '5' => .digit_5,
+                '6' => .digit_6,
+                '7' => .digit_7,
+                '8' => .digit_8,
+                '9' => .digit_9,
+                ' ' => .space,
+                '\'' => .apostrophe,
+                '\\' => .backslash,
+                '`' => .backtick,
+                '[' => .bracket_left,
+                ']' => .bracket_right,
+                ',' => .comma,
+                '=' => .equal,
+                '-' => .minus,
+                '.' => .period,
+                ';' => .semicolon,
+                '/' => .slash,
+                else => null,
+            },
+            .down => .down,
+            .left => .left,
+            .right => .right,
+            .up => .up,
+            .end => .end,
+            .home => .home,
+            .page_down => .page_down,
+            .page_up => .page_up,
+            .backspace => .backspace,
+            .delete => .delete,
+            .enter => .enter,
+            .insert => .insert,
+            .tab => .tab,
+            .f1 => .f1,
+            .f2 => .f2,
+            .f3 => .f3,
+            .f4 => .f4,
+            .f5 => .f5,
+            .f6 => .f6,
+            .f7 => .f7,
+            .f8 => .f8,
+            .f9 => .f9,
+            .f10 => .f10,
+            .f11 => .f11,
+            .f12 => .f12,
+            .f13 => .f13,
+            .f14 => .f14,
+            .f15 => .f15,
+            .f16 => .f16,
+            .f17 => .f17,
+            .f18 => .f18,
+            .f19 => .f19,
+            .f20 => .f20,
+            .f21 => .f21,
+            .f22 => .f22,
+            .f23 => .f23,
+            .f24 => .f24,
+            .escape => .escape,
+            else => null,
+        };
+    }
+};
+
+pub const ShortcutModifiers = packed struct(u8) {
+    alt: bool = false,
+    control: bool = false,
+    meta: bool = false,
+    shift: bool = false,
+    _padding: u4 = 0,
+};
