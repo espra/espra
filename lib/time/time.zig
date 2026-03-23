@@ -4,8 +4,8 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const sys = @import("sys");
-const tzdata = @import("tzdata.zig");
 const xxh3 = @import("xxh3");
+const tzdata = @import("tzdata.zig");
 
 pub const ParseError = error{
     InvalidDuration,
