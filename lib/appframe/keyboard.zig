@@ -406,10 +406,10 @@ pub const Shortcut = extern struct {
         }
         const key = ShortcutKey.from_logical(event.logical) orelse return false;
         return key == self.key and
-            event.modifers.alt == self.modifiers.alt and
-            event.modifers.control == self.modifiers.control and
-            event.modifers.meta == self.modifiers.meta and
-            event.modifers.shift == self.modifiers.shift;
+            event.modifiers.alt == self.modifiers.alt and
+            event.modifiers.control == self.modifiers.control and
+            event.modifiers.meta == self.modifiers.meta and
+            event.modifiers.shift == self.modifiers.shift;
     }
 };
 
