@@ -54,6 +54,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const wgpu_mod = b.addModule("wgpu", .{
+        .root_source_file = b.path("lib/wgpu/wgpu.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const wgpu_native_mod = b.addTranslateC(.{
+        .root_source_file = b.path("dep/wgpu-native/include/wgpu.h"),
+        .target = target,
+        .optimize = optimize,
+    }).createModule();
+
     const xxh3_mod = b.addModule("xxh3", .{
         .root_source_file = b.path("lib/xxh3/xxh3.zig"),
         .target = target,
@@ -98,10 +110,13 @@ pub fn build(b: *std.Build) void {
     });
 
     // Add module imports
+    appframe_mod.addImport("wgpu", wgpu_mod);
     time_mod.addImport("sys", sys_mod);
     time_mod.addImport("xxh3", xxh3_mod);
+    wgpu_mod.addImport("wgpu-native", wgpu_native_mod);
 
     // Add executable imports
+    scaffold_exe.root_module.addImport("appframe", appframe_mod);
     scaffold_exe.root_module.addImport("sys", sys_mod);
     scaffold_exe.root_module.addImport("time", time_mod);
 
@@ -111,7 +126,10 @@ pub fn build(b: *std.Build) void {
     // Add tests
     const test_step = b.step("test", "Run tests");
     const test_files = .{
+        .{ "appframe", appframe_mod },
+        .{ "sys", sys_mod },
         .{ "time", time_mod },
+        .{ "wgpu", wgpu_mod },
         .{ "xxh3", xxh3_mod },
     };
     inline for (test_files) |entry| {
