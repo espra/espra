@@ -184,11 +184,11 @@ pub const Instant = struct {
     }
 
     pub fn after(self: Instant, other: Instant) bool {
-        return self.seconds > other.seconds or (self.seconds == other.seconds and self.nanoseconds > other.nanoseconds);
+        return self.order(other) == .gt;
     }
 
     pub fn before(self: Instant, other: Instant) bool {
-        return self.seconds < other.seconds or (self.seconds == other.seconds and self.nanoseconds < other.nanoseconds);
+        return self.order(other) == .lt;
     }
 
     pub fn datetime(self: Instant) DateTime {
@@ -196,7 +196,23 @@ pub const Instant = struct {
     }
 
     pub fn equal(self: Instant, other: Instant) bool {
-        return self.seconds == other.seconds and self.nanoseconds == other.nanoseconds;
+        return self.order(other) == .eq;
+    }
+
+    pub fn order(self: Instant, other: Instant) std.math.Order {
+        if (self.monotonic != 0 and other.monotonic != 0) {
+            if (self.monotonic != other.monotonic) {
+                return if (self.monotonic < other.monotonic) .lt else .gt;
+            }
+            return .eq;
+        }
+        if (self.seconds != other.seconds) {
+            return if (self.seconds < other.seconds) .lt else .gt;
+        }
+        if (self.nanoseconds != other.nanoseconds) {
+            return if (self.nanoseconds < other.nanoseconds) .lt else .gt;
+        }
+        return .eq;
     }
 
     pub fn to(self: Instant, timezone: sys.Timezone) DateTime {
@@ -1409,6 +1425,80 @@ test "add one week" {
     };
     const result = original.add(Week);
     try testing.expectEqual(@as(i64, 1736942400 + 604800), result.seconds);
+}
+
+test "order seconds before nanoseconds" {
+    const earlier = Instant{
+        .adjustment = .none,
+        .monotonic = 0,
+        .nanoseconds = 999_999_999,
+        .seconds = 1736942400,
+    };
+    const later = Instant{
+        .adjustment = .none,
+        .monotonic = 0,
+        .nanoseconds = 0,
+        .seconds = 1736942401,
+    };
+    try testing.expectEqual(std.math.Order.lt, earlier.order(later));
+    try testing.expectEqual(std.math.Order.gt, later.order(earlier));
+}
+
+test "order nanoseconds when seconds match" {
+    const earlier = Instant{
+        .adjustment = .none,
+        .monotonic = 0,
+        .nanoseconds = 123,
+        .seconds = 1736942400,
+    };
+    const later = Instant{
+        .adjustment = .none,
+        .monotonic = 0,
+        .nanoseconds = 456,
+        .seconds = 1736942400,
+    };
+    try testing.expectEqual(std.math.Order.lt, earlier.order(later));
+    try testing.expectEqual(std.math.Order.gt, later.order(earlier));
+    try testing.expectEqual(std.math.Order.eq, earlier.order(earlier));
+}
+
+test "comparison methods prefer monotonic" {
+    const earlier = Instant{
+        .adjustment = .none,
+        .monotonic = 10,
+        .nanoseconds = 0,
+        .seconds = 1736942401,
+    };
+    const later = Instant{
+        .adjustment = .none,
+        .monotonic = 20,
+        .nanoseconds = 999_999_999,
+        .seconds = 1736942400,
+    };
+    try testing.expect(earlier.before(later));
+    try testing.expect(!earlier.after(later));
+    try testing.expect(!earlier.equal(later));
+    try testing.expectEqual(std.math.Order.lt, earlier.order(later));
+    try testing.expect(later.after(earlier));
+}
+
+test "equal with matching monotonic" {
+    const first = Instant{
+        .adjustment = .none,
+        .monotonic = 1234,
+        .nanoseconds = 0,
+        .seconds = 1736942400,
+    };
+    const second = Instant{
+        .adjustment = .none,
+        .monotonic = 1234,
+        .nanoseconds = 999_999_999,
+        .seconds = 1736942401,
+    };
+    try testing.expect(first.equal(second));
+    try testing.expectEqual(std.math.Order.eq, first.order(second));
+    try testing.expect(!first.before(second));
+    try testing.expect(!first.after(second));
 }
 
 test "rfc3339 UTC" {
