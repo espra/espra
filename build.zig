@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const os = target.result.os.tag;
+    const is_android = os == .linux and builtin.abi == .android;
     const is_darwin = os == .macos or os == .ios;
 
     // Check Zig version
@@ -32,8 +33,19 @@ pub fn build(b: *std.Build) void {
         };
     }
 
+    // Build environment variables
+    const zig_path = b.graph.zig_exe;
+    const zig_triple = target.result.zigTriple(b.allocator) catch @panic("OOM");
+    const rust_triple = zig_to_rust_triple(target.result);
+
+    const ar = std.fmt.allocPrint(b.allocator, "{s} ar", .{zig_path}) catch @panic("OOM");
+    const cc = std.fmt.allocPrint(b.allocator, "{s} -target {s}", .{ zig_path, zig_triple }) catch @panic("OOM");
+
     // Run make to create generated files
     const make = b.addSystemCommand(&.{ "make", "-s", "generate" });
+    make.setEnvironmentVariable("AR", ar);
+    make.setEnvironmentVariable("CARGO_BUILD_TARGET", rust_triple);
+    make.setEnvironmentVariable("CC", cc);
 
     // Create modules
     const appframe_mod = b.addModule("appframe", .{
@@ -60,11 +72,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const wgpu_native_mod = b.addTranslateC(.{
-        .root_source_file = b.path("dep/wgpu-native/include/wgpu.h"),
+    const wgpu_native_c = b.addTranslateC(.{
+        .root_source_file = b.path("dep/wgpu-native/ffi/wgpu.h"),
         .target = target,
         .optimize = optimize,
-    }).createModule();
+    });
+
+    wgpu_native_c.addIncludePath(b.path("dep/wgpu-native/ffi/webgpu-headers"));
+    wgpu_native_c.step.dependOn(&make.step);
+
+    const wgpu_native_mod = wgpu_native_c.createModule();
 
     const xxh3_mod = b.addModule("xxh3", .{
         .root_source_file = b.path("lib/xxh3/xxh3.zig"),
@@ -94,11 +111,29 @@ pub fn build(b: *std.Build) void {
         appframe_mod.linkFramework("Foundation", .{});
         sys_mod.linkSystemLibrary("objc", .{});
         sys_mod.linkFramework("Foundation", .{});
+        wgpu_native_mod.linkFramework("Foundation", .{});
+        wgpu_native_mod.linkFramework("Metal", .{});
+        wgpu_native_mod.linkFramework("QuartzCore", .{});
         if (os == .macos) {
             appframe_mod.linkFramework("AppKit", .{});
         } else {
             appframe_mod.linkFramework("UIKit", .{});
         }
+    } else if (os == .linux) {
+        wgpu_native_mod.linkSystemLibrary("dl", .{});
+        wgpu_native_mod.linkSystemLibrary("m", .{});
+        if (is_android) {
+            wgpu_native_mod.linkSystemLibrary("android", .{});
+        }
+    } else if (os == .windows) {
+        wgpu_native_mod.linkSystemLibrary("Propsys", .{});
+        wgpu_native_mod.linkSystemLibrary("RuntimeObject", .{});
+        wgpu_native_mod.linkSystemLibrary("bcrypt", .{});
+        wgpu_native_mod.linkSystemLibrary("d3dcompiler", .{});
+        wgpu_native_mod.linkSystemLibrary("ntdll", .{});
+        wgpu_native_mod.linkSystemLibrary("opengl32", .{});
+        wgpu_native_mod.linkSystemLibrary("userenv", .{});
+        wgpu_native_mod.linkSystemLibrary("ws2_32", .{});
     }
 
     xxh3_mod.addIncludePath(b.path("dep/xxhash"));
@@ -108,6 +143,8 @@ pub fn build(b: *std.Build) void {
             "-DXXH_CPU_LITTLE_ENDIAN=1",
         },
     });
+
+    wgpu_native_mod.addObjectFile(b.path("dep/wgpu-native/target/release/libwgpu_native.a"));
 
     // Add module imports
     appframe_mod.addImport("wgpu", wgpu_mod);
@@ -148,4 +185,69 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run scaffold");
     run_step.dependOn(&run_cmd.step);
+}
+
+fn zig_to_rust_triple(target: std.Target) []const u8 {
+    switch (target.os.tag) {
+        .ios => {
+            if (target.cpu.arch == .aarch64) {
+                switch (target.abi) {
+                    .none => {
+                        return "aarch64-apple-ios";
+                    },
+                    .simulator => {
+                        return "aarch64-apple-ios-sim";
+                    },
+                    else => {},
+                }
+            }
+        },
+        .linux => {
+            switch (target.cpu.arch) {
+                .aarch64 => {
+                    switch (target.abi) {
+                        .gnu => {
+                            return "aarch64-unknown-linux-gnu";
+                        },
+                        .musl => {
+                            return "aarch64-unknown-linux-musl";
+                        },
+                        else => {},
+                    }
+                },
+                .x86_64 => {
+                    switch (target.abi) {
+                        .gnu => {
+                            return "x86_64-unknown-linux-gnu";
+                        },
+                        .musl => {
+                            return "x86_64-unknown-linux-musl";
+                        },
+                        else => {},
+                    }
+                },
+                else => {},
+            }
+        },
+        .macos => {
+            if (target.cpu.arch == .aarch64) {
+                return "aarch64-apple-darwin";
+            }
+        },
+        .windows => {
+            if (target.cpu.arch == .x86_64) {
+                switch (target.abi) {
+                    .gnu => {
+                        return "x86_64-pc-windows-gnu";
+                    },
+                    .msvc => {
+                        return "x86_64-pc-windows-msvc";
+                    },
+                    else => {},
+                }
+            }
+        },
+        else => {},
+    }
+    @panic("Unsupported OS, architecture, and ABI combination");
 }
