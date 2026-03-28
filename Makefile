@@ -1,7 +1,7 @@
 # Public Domain (-) 2026-present, The Espra Core Authors.
 # See the Espra Core UNLICENSE file for details.
 
-.PHONY: dependencies generate wgpu-native/build wgpu-native/clone
+.PHONY: dependencies generate wgpu-native/build wgpu-native/clone wuffs/clone
 .SILENT:
 
 UNAME := $(shell uname -s 2>/dev/null)
@@ -16,7 +16,7 @@ endif
 
 WGPU_SOURCES := $(shell find dep/wgpu-native/src -name '*.rs' 2>/dev/null)
 
-dependencies: wgpu-native/build
+dependencies: wgpu-native/build wuffs/clone
 
 generate: dependencies lib/sys/locale_info.zig lib/time/tzdata.zig
 
@@ -31,6 +31,9 @@ wgpu-native/build: wgpu-native/clone
 
 wgpu-native/clone:
 	./tool/clone_repo.py wgpu-native https://github.com/gfx-rs/wgpu-native.git ccffe5755fac311d567131e5797ff5aa0a2b9369 --init-submodules
+
+wuffs/clone:
+	./tool/clone_repo.py wuffs https://github.com/google/wuffs.git b9145634fd0c39026a73aed601626616763f4a54
 
 $(WGPU_TARGET): $(WGPU_SOURCES) dep/wgpu-native/Cargo.toml dep/wgpu-native/Cargo.lock
 	echo ">> Building wgpu-native ...\n"
