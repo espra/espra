@@ -6,6 +6,11 @@ const std = @import("std");
 
 const min_zig_version = "0.16.0-dev.2915+065c6e794";
 
+const ZigModule = struct {
+    name: []const u8,
+    module: *std.Build.Module,
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -48,29 +53,17 @@ pub fn build(b: *std.Build) void {
     make.setEnvironmentVariable("CC", cc);
 
     // Create modules
-    const appframe_mod = b.addModule("appframe", .{
-        .root_source_file = b.path("lib/appframe/appframe.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const sys_mod = b.addModule("sys", .{
-        .root_source_file = b.path("lib/sys/sys.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const time_mod = b.addModule("time", .{
-        .root_source_file = b.path("lib/time/time.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const wgpu_mod = b.addModule("wgpu", .{
-        .root_source_file = b.path("lib/wgpu/wgpu.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    var zig_modules: std.ArrayList(ZigModule) = .empty;
+    const appframe_mod = add_module(b, "appframe", target, optimize, &zig_modules);
+    const bench_mod = add_module(b, "bench", target, optimize, &zig_modules);
+    const cli_mod = add_module(b, "cli", target, optimize, &zig_modules);
+    const gfx_mod = add_module(b, "gfx", target, optimize, &zig_modules);
+    const ident_mod = add_module(b, "ident", target, optimize, &zig_modules);
+    const sys_mod = add_module(b, "sys", target, optimize, &zig_modules);
+    const time_mod = add_module(b, "time", target, optimize, &zig_modules);
+    const wgpu_mod = add_module(b, "wgpu", target, optimize, &zig_modules);
+    const wuffs_mod = add_module(b, "wuffs", target, optimize, &zig_modules);
+    const xxh3_mod = add_module(b, "xxh3", target, optimize, &zig_modules);
 
     const wgpu_native_c = b.addTranslateC(.{
         .root_source_file = b.path("dep/wgpu-native/ffi/wgpu.h"),
@@ -83,11 +76,31 @@ pub fn build(b: *std.Build) void {
 
     const wgpu_native_mod = wgpu_native_c.createModule();
 
-    const xxh3_mod = b.addModule("xxh3", .{
-        .root_source_file = b.path("lib/xxh3/xxh3.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
+    wuffs_mod.addCSourceFile(.{
+        .file = b.path("dep/wuffs/release/c/wuffs-unsupported-snapshot.c"),
+        .flags = &.{
+            "-DWUFFS_IMPLEMENTATION",
+            "-DWUFFS_CONFIG__MODULES",
+            "-DWUFFS_CONFIG__MODULE__ADLER32",
+            "-DWUFFS_CONFIG__MODULE__BASE",
+            "-DWUFFS_CONFIG__MODULE__BMP",
+            "-DWUFFS_CONFIG__MODULE__BZIP2",
+            "-DWUFFS_CONFIG__MODULE__CRC32",
+            "-DWUFFS_CONFIG__MODULE__CRC64",
+            "-DWUFFS_CONFIG__MODULE__DEFLATE",
+            "-DWUFFS_CONFIG__MODULE__GIF",
+            "-DWUFFS_CONFIG__MODULE__GZIP",
+            "-DWUFFS_CONFIG__MODULE__JPEG",
+            "-DWUFFS_CONFIG__MODULE__LZIP",
+            "-DWUFFS_CONFIG__MODULE__LZMA",
+            "-DWUFFS_CONFIG__MODULE__LZW",
+            "-DWUFFS_CONFIG__MODULE__PNG",
+            "-DWUFFS_CONFIG__MODULE__QOI",
+            "-DWUFFS_CONFIG__MODULE__THUMBHASH",
+            "-DWUFFS_CONFIG__MODULE__WEBP",
+            "-DWUFFS_CONFIG__MODULE__XZ",
+            "-DWUFFS_CONFIG__MODULE__ZLIB",
+        },
     });
 
     // Create executables
@@ -148,12 +161,17 @@ pub fn build(b: *std.Build) void {
 
     // Add module imports
     appframe_mod.addImport("wgpu", wgpu_mod);
+    gfx_mod.addImport("wuffs", wuffs_mod);
     time_mod.addImport("sys", sys_mod);
     time_mod.addImport("xxh3", xxh3_mod);
     wgpu_mod.addImport("wgpu-native", wgpu_native_mod);
 
     // Add executable imports
     scaffold_exe.root_module.addImport("appframe", appframe_mod);
+    scaffold_exe.root_module.addImport("bench", bench_mod);
+    scaffold_exe.root_module.addImport("cli", cli_mod);
+    scaffold_exe.root_module.addImport("gfx", gfx_mod);
+    scaffold_exe.root_module.addImport("ident", ident_mod);
     scaffold_exe.root_module.addImport("sys", sys_mod);
     scaffold_exe.root_module.addImport("time", time_mod);
 
@@ -162,20 +180,13 @@ pub fn build(b: *std.Build) void {
 
     // Add tests
     const test_step = b.step("test", "Run tests");
-    const test_files = .{
-        .{ "appframe", appframe_mod },
-        .{ "sys", sys_mod },
-        .{ "time", time_mod },
-        .{ "wgpu", wgpu_mod },
-        .{ "xxh3", xxh3_mod },
-    };
-    inline for (test_files) |entry| {
-        const t = b.addTest(.{ .root_module = entry[1] });
+    for (zig_modules.items) |zig_module| {
+        const t = b.addTest(.{ .root_module = zig_module.module });
         t.step.dependOn(&make.step);
         t.filters = b.args orelse &.{};
         const run = b.addRunArtifact(t);
         test_step.dependOn(&run.step);
-        const mod_test_step = b.step("test-" ++ entry[0], "Run " ++ entry[0] ++ " tests");
+        const mod_test_step = b.step(b.fmt("test-{s}", .{zig_module.name}), b.fmt("Run {s} tests", .{zig_module.name}));
         mod_test_step.dependOn(&run.step);
     }
 
@@ -185,6 +196,22 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run scaffold");
     run_step.dependOn(&run_cmd.step);
+}
+
+fn add_module(
+    b: *std.Build,
+    name: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zig_modules: *std.ArrayList(ZigModule),
+) *std.Build.Module {
+    const mod = b.addModule(name, .{
+        .root_source_file = b.path(b.fmt("lib/{s}/{s}.zig", .{ name, name })),
+        .target = target,
+        .optimize = optimize,
+    });
+    zig_modules.append(b.allocator, .{ .name = name, .module = mod }) catch @panic("OOM");
+    return mod;
 }
 
 fn zig_to_rust_triple(target: std.Target) []const u8 {
