@@ -6,22 +6,36 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const EnumField = std.builtin.Type.EnumField;
 
+pub const AppOptions = struct {
+    description: ?[]const u8 = null,
+    enable_completion_command: bool = false,
+    enable_help_command: bool = false,
+    name: ?[]const u8 = null,
+    show_defaults: ?bool = null,
+    version: ?[]const u8 = null,
+};
+
 pub fn App(comptime RootCommand: type) type {
     return AppWithGroups(RootCommand, void, void);
 }
 
-pub fn AppWithGroups(comptime RootCommand: type, comptime OptionGroup: type, comptime CommandGroup: type) type {
+pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, comptime OptionGroup: type) type {
+    if (CommandGroup != void and @typeInfo(CommandGroup) != .@"enum") {
+        @compileError("CommandGroup must be an enum type");
+    }
+    if (OptionGroup != void and @typeInfo(OptionGroup) != .@"enum") {
+        @compileError("OptionGroup must be an enum type");
+    }
     return struct {
         arena: std.heap.ArenaAllocator,
         args: []const []const u8,
         invoked_command: Command(RootCommand),
+        options: AppOptions,
         root: *RootCommand,
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator) !Self {
-            _ = OptionGroup;
-            _ = CommandGroup;
+        pub fn init(allocator: Allocator, options: AppOptions) !Self {
             var arena = std.heap.ArenaAllocator.init(allocator);
             errdefer arena.deinit();
             const root = try arena.allocator().create(RootCommand);
@@ -29,6 +43,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime OptionGroup: type, com
                 .arena = arena,
                 .args = &.{},
                 .invoked_command = .Default,
+                .options = options,
                 .root = root,
             };
         }
@@ -37,9 +52,11 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime OptionGroup: type, com
             self.arena.deinit();
         }
 
-        pub fn command(self: *Self, comptime path: anytype, info: CommandInfo) !void {
+        pub fn subcommand(self: *Self, cmd: Command(RootCommand), info: CommandInfo(CommandGroup)) void {
+            if (cmd == .Default) {
+                @panic("Only custom subcommands can be defined, not Default");
+            }
             _ = self;
-            _ = path;
             _ = info;
         }
 
@@ -62,10 +79,15 @@ pub fn Command(comptime RootCommand: type) type {
     return @Enum(u16, .exhaustive, &field_names, &field_values);
 }
 
-pub const CommandInfo = struct {
-    description: []const u8,
-    help: ?[]const u8 = null,
-};
+pub fn CommandInfo(comptime CommandGroup: type) type {
+    return struct {
+        aliases: []const []const u8 = &.{},
+        description: []const u8,
+        group: ?CommandGroup = null,
+        help: ?[]const u8 = null,
+        usage_args: []const u8 = "",
+    };
+}
 
 fn construct_command_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u16, next: *usize) void {
     const fields = @typeInfo(T).@"struct".fields;
@@ -202,8 +224,9 @@ pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    const app = try App(MyApp).init(allocator);
+    var app = try App(MyApp).init(allocator, .{});
     defer app.deinit();
+    app.subcommand(.Foo, .{ .description = "Foo command" });
     switch (app.invoked_command) {
         .Default => {
             std.debug.print("Default\n", .{});
