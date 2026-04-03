@@ -10,8 +10,16 @@ pub const AppOptions = struct {
     description: ?[]const u8 = null,
     enable_completion_command: bool = false,
     enable_help_command: bool = false,
+    env_var_prefix: ?[]const u8 = null,
+    epilog: ?[]const u8 = null,
+    max_args: ?usize = null,
+    min_args: ?usize = null,
     name: ?[]const u8 = null,
+    preserve_unmatched_short_options: bool = false,
+    prolog: ?[]const u8 = null,
     show_defaults: ?bool = null,
+    summary: ?[]const u8 = null,
+    usage: ?Usage = null,
     version: ?[]const u8 = null,
 };
 
@@ -29,9 +37,10 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
     return struct {
         arena: std.heap.ArenaAllocator,
         args: []const []const u8,
-        invoked_command: Command(RootCommand),
+        invoked_command: InvokedCommand(RootCommand),
         options: AppOptions,
         root: *RootCommand,
+        unmatched_short_options: ?[]const u8,
 
         const Self = @This();
 
@@ -45,6 +54,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
                 .invoked_command = .Default,
                 .options = options,
                 .root = root,
+                .unmatched_short_options = null,
             };
         }
 
@@ -52,11 +62,9 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
             self.arena.deinit();
         }
 
-        pub fn subcommand(self: *Self, cmd: Command(RootCommand), info: CommandInfo(CommandGroup)) void {
-            if (cmd == .Default) {
-                @panic("Only custom subcommands can be defined, not Default");
-            }
+        pub fn option(self: *Self, opt: Option(RootCommand), info: OptionInfo(RootCommand, OptionGroup)) void {
             _ = self;
+            _ = opt;
             _ = info;
         }
 
@@ -65,10 +73,38 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
             // defer std.process.argsFree(allocator, args);
             _ = self;
         }
+
+        pub fn require_explicit_definitions(self: *Self) void {
+            _ = self;
+        }
+
+        pub fn subcommand(self: *Self, cmd: Subcommand(RootCommand), info: CommandInfo(RootCommand, CommandGroup)) void {
+            _ = self;
+            _ = cmd;
+            _ = info;
+        }
     };
 }
 
-pub fn Command(comptime RootCommand: type) type {
+pub fn CommandInfo(comptime RootCommand: type, comptime CommandGroup: type) type {
+    return struct {
+        aliases: []const InvokedCommand(RootCommand) = &.{},
+        deprecated: ?[]const u8 = null,
+        description: ?[]const u8 = null,
+        epilog: ?[]const u8 = null,
+        group: ?CommandGroup = null,
+        hidden: bool = false,
+        max_args: ?usize = null,
+        min_args: ?usize = null,
+        name: ?[]const u8 = null,
+        preserve_unmatched_short_options: bool = false,
+        prolog: ?[]const u8 = null,
+        summary: ?[]const u8 = null,
+        usage: ?Usage = null,
+    };
+}
+
+pub fn InvokedCommand(comptime RootCommand: type) type {
     const count = find_subcommands(RootCommand, "") + 1;
     comptime var field_names: [count][]const u8 = undefined;
     comptime var field_values: [count]u16 = undefined;
@@ -79,15 +115,48 @@ pub fn Command(comptime RootCommand: type) type {
     return @Enum(u16, .exhaustive, &field_names, &field_values);
 }
 
-pub fn CommandInfo(comptime CommandGroup: type) type {
+pub fn Option(comptime RootCommand: type) type {
+    const count = find_options(RootCommand, "");
+    comptime var field_names: [count][]const u8 = undefined;
+    comptime var field_values: [count]u32 = undefined;
+    comptime var i: usize = 0;
+    construct_option_enum(RootCommand, "", &field_names, &field_values, &i);
+    return @Enum(u32, .exhaustive, &field_names, &field_values);
+}
+
+pub fn OptionInfo(comptime RootCommand: type, comptime OptionGroup: type) type {
     return struct {
-        aliases: []const []const u8 = &.{},
-        description: []const u8,
-        group: ?CommandGroup = null,
-        help: ?[]const u8 = null,
-        usage_args: []const u8 = "",
+        default_text: ?[]const u8 = null,
+        deprecated: ?[]const u8 = null,
+        env_var: ?[]const u8 = null,
+        group: ?OptionGroup = null,
+        hidden: bool = false,
+        inherited: bool = false,
+        long: ?[]const u8 = null,
+        long_aliases: []const []const u8 = &.{},
+        mutually_exclusive_with: []const Option(RootCommand) = &.{},
+        required: bool = false,
+        requires: []const Option(RootCommand) = &.{},
+        short: ?u8 = null,
+        show_default: ?bool = null,
+        summary: ?[]const u8 = null,
+        value_label: ?[]const u8 = null,
     };
 }
+
+pub fn Subcommand(comptime RootCommand: type) type {
+    const count = find_subcommands(RootCommand, "");
+    comptime var field_names: [count][]const u8 = undefined;
+    comptime var field_values: [count]u16 = undefined;
+    comptime var i: usize = 0;
+    construct_command_enum(RootCommand, "", &field_names, &field_values, &i);
+    return @Enum(u16, .exhaustive, &field_names, &field_values);
+}
+
+pub const Usage = union(enum) {
+    args: []const u8,
+    full_text: []const u8,
+};
 
 fn construct_command_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u16, next: *usize) void {
     const fields = @typeInfo(T).@"struct".fields;
@@ -101,6 +170,36 @@ fn construct_command_enum(comptime T: type, comptime prefix: []const u8, field_n
         next.* += 1;
         construct_command_enum(field.type, name, field_names, field_values, next);
     }
+}
+
+fn construct_option_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u32, next: *usize) void {
+    const fields = @typeInfo(T).@"struct".fields;
+    for (fields) |field| {
+        if (std.ascii.isUpper(field.name[0])) {
+            const name = if (prefix.len == 0) field.name ++ "_" else prefix ++ field.name ++ "_";
+            construct_option_enum(field.type, name, field_names, field_values, next);
+        } else {
+            field_names[next.*] = prefix ++ field.name;
+            field_values[next.*] = next.*;
+            next.* += 1;
+        }
+    }
+}
+
+fn find_options(comptime T: type, comptime prefix: []const u8) usize {
+    const fields = switch (@typeInfo(T)) {
+        .@"struct" => |info| info.fields,
+        else => @compileError("Expected struct type for RootCommand" ++ prefix ++ ", got " ++ @typeName(T)),
+    };
+    var count: usize = 0;
+    for (fields) |field| {
+        if (std.ascii.isUpper(field.name[0])) {
+            count += find_options(field.type, prefix ++ "." ++ field.name);
+        } else {
+            count += 1;
+        }
+    }
+    return count;
 }
 
 fn find_subcommands(comptime T: type, comptime prefix: []const u8) usize {
@@ -183,7 +282,7 @@ test "enum fields for subcommands" {
             Nested: struct {},
         },
     };
-    const fields = @typeInfo(Command(Root)).@"enum".fields;
+    const fields = @typeInfo(InvokedCommand(Root)).@"enum".fields;
     try testing.expectEqual(@as(usize, 6), fields.len);
     const expected = [_][]const u8{ "Default", "Foo", "Foo_Bar", "Foo_Baz", "Foo_Baz_Spam", "Help" };
     inline for (expected, 0..) |name, i| {
@@ -217,7 +316,9 @@ const MyApp = struct {
         Bar: struct {
             hello: bool,
         },
+        baz: bool,
     },
+    spam: bool,
 };
 
 pub fn main() !void {
@@ -226,7 +327,9 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     var app = try App(MyApp).init(allocator, .{});
     defer app.deinit();
-    app.subcommand(.Foo, .{ .description = "Foo command" });
+    app.subcommand(.Foo, .{ .summary = "Foo command" });
+    app.option(.spam, .{ .summary = "option" });
+    app.option(.Foo_Bar_hello, .{ .summary = "option" });
     switch (app.invoked_command) {
         .Default => {
             std.debug.print("Default\n", .{});
