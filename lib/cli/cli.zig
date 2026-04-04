@@ -1,27 +1,42 @@
 // Public Domain (-) 2026-present, The Espra Core Authors.
 // See the Espra Core UNLICENSE file for details.
 
+const builtin = @import("builtin");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const EnumField = std.builtin.Type.EnumField;
 
-pub const AppOptions = struct {
-    description: ?[]const u8 = null,
-    enable_completion_command: bool = false,
-    enable_help_command: bool = false,
-    env_var_prefix: ?[]const u8 = null,
-    epilog: ?[]const u8 = null,
-    max_args: ?usize = null,
-    min_args: ?usize = null,
-    name: ?[]const u8 = null,
-    preserve_unmatched_short_options: bool = false,
-    prolog: ?[]const u8 = null,
-    show_defaults: ?bool = null,
-    summary: ?[]const u8 = null,
-    usage: ?Usage = null,
-    version: ?[]const u8 = null,
+pub const ParseError = error{
+    InvalidOption,
+    InvalidSubcommand,
+    MissingRequired,
 };
+
+const min_terminal_width: u16 = 80;
+
+pub fn AppOptions(comptime RootCommand: type) type {
+    return struct {
+        allocator: ?Allocator = null,
+        complete: Completer(RootCommand) = null,
+        description: ?[]const u8 = null,
+        enable_completion_command: bool = false,
+        enable_help_command: bool = false,
+        env_var_prefix: ?[]const u8 = null,
+        epilog: ?[]const u8 = null,
+        format_error: ?*const fn (*std.Io.Writer, ErrorContext(RootCommand)) anyerror!void = null,
+        format_help: ?*const fn (*std.Io.Writer, HelpContext(RootCommand)) anyerror!void = null,
+        max_args: ?usize = null,
+        min_args: ?usize = null,
+        name: []const u8,
+        preserve_unmatched_short_options: bool = false,
+        prolog: ?[]const u8 = null,
+        show_defaults: ?bool = null,
+        summary: ?[]const u8 = null,
+        usage: ?Usage = null,
+        version: ?[]const u8 = null,
+    };
+}
 
 pub fn App(comptime RootCommand: type) type {
     return AppWithGroups(RootCommand, void, void);
@@ -37,20 +52,34 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
     return struct {
         arena: std.heap.ArenaAllocator,
         args: []const []const u8,
+        backing_allocator: ?*std.heap.DebugAllocator(.{}),
         invoked_command: InvokedCommand(RootCommand),
-        options: AppOptions,
+        options: AppOptions(RootCommand),
         root: *RootCommand,
         unmatched_short_options: ?[]const u8,
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator, options: AppOptions) !Self {
+        pub fn init(options: AppOptions(RootCommand)) !Self {
+            var backing_allocator: ?*std.heap.DebugAllocator(.{}) = if (builtin.mode == .Debug) blk: {
+                if (options.allocator != null) {
+                    break :blk null;
+                }
+                const raw = try std.heap.page_allocator.create(std.heap.DebugAllocator(.{}));
+                raw.* = .init;
+                break :blk raw;
+            } else null;
+            const allocator = options.allocator orelse if (builtin.mode == .Debug)
+                backing_allocator.?.allocator()
+            else
+                std.heap.smp_allocator;
             var arena = std.heap.ArenaAllocator.init(allocator);
             errdefer arena.deinit();
             const root = try arena.allocator().create(RootCommand);
             return .{
                 .arena = arena,
                 .args = &.{},
+                .backing_allocator = backing_allocator,
                 .invoked_command = .Default,
                 .options = options,
                 .root = root,
@@ -58,8 +87,12 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
             };
         }
 
-        pub fn deinit(self: Self) void {
+        pub fn deinit(self: *Self) void {
             self.arena.deinit();
+            if (self.backing_allocator) |allocator| {
+                _ = allocator.deinit();
+                std.heap.page_allocator.destroy(allocator);
+            }
         }
 
         pub fn option(self: *Self, opt: Option(RootCommand), info: OptionInfo(RootCommand, OptionGroup)) void {
@@ -68,10 +101,17 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
             _ = info;
         }
 
-        pub fn parse(self: *Self) !void {
+        pub fn parse(self: *Self) SuccessResult(RootCommand) {
             // const args = try std.process.argsAlloc(allocator);
             // defer std.process.argsFree(allocator, args);
-            _ = self;
+            // _ = self;
+            return .{
+                .args = &.{},
+                .invoked_command = .Default,
+                .root = self.root,
+                .unmatched_short_options = null,
+                .warnings = &.{},
+            };
         }
 
         pub fn require_explicit_definitions(self: *Self) void {
@@ -86,9 +126,35 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
     };
 }
 
+pub const CommandError = struct {
+    command_path: []const u8,
+    kind: Kind,
+    message: []const u8,
+
+    pub const Kind = union(enum) {
+        missing_explicit_definition: union(enum) {
+            option: []const u8,
+            subcommand: []const u8,
+        },
+        too_few_args: struct { min_args: usize },
+        too_many_args: struct { max_args: usize },
+        unknown_option: struct { option_name: []const u8 },
+        unknown_subcommand: struct { subcommand_name: []const u8 },
+    };
+};
+
+pub const CommandHelpEntry = struct {
+    description: ?[]const u8 = null,
+    epilog: ?[]const u8 = null,
+    prolog: ?[]const u8 = null,
+    summary: ?[]const u8 = null,
+    usage: ?[]const u8 = null,
+};
+
 pub fn CommandInfo(comptime RootCommand: type, comptime CommandGroup: type) type {
     return struct {
-        aliases: []const InvokedCommand(RootCommand) = &.{},
+        aliases: []const Subcommand(RootCommand) = &.{},
+        complete: Completer(RootCommand) = null,
         deprecated: ?[]const u8 = null,
         description: ?[]const u8 = null,
         epilog: ?[]const u8 = null,
@@ -101,6 +167,74 @@ pub fn CommandInfo(comptime RootCommand: type, comptime CommandGroup: type) type
         prolog: ?[]const u8 = null,
         summary: ?[]const u8 = null,
         usage: ?Usage = null,
+    };
+}
+
+pub const CommandWarning = struct {
+    command_path: []const u8,
+    message: []const u8,
+};
+
+pub fn Completer(comptime RootCommand: type) type {
+    return ?*const fn (
+        allocator: Allocator,
+        root: *const RootCommand,
+        invoked_command: InvokedCommand(RootCommand),
+        args: []const u8,
+    ) anyerror![]const Completion;
+}
+
+pub const Completion = struct {
+    description: ?[]const u8 = null,
+    value: []const u8,
+};
+
+pub fn DecodeResult(comptime T: type) type {
+    return union(enum) {
+        err: []const u8,
+        ok: T,
+    };
+}
+
+pub fn ErrorContext(comptime RootCommand: type) type {
+    return struct {
+        app: AppOptions(RootCommand),
+        command_path: []const u8,
+        message: []const u8,
+        usage: ?[]const u8,
+        warning: bool,
+    };
+}
+
+pub const ErrorResult = union(enum) {
+    command: CommandError,
+    option: OptionError,
+};
+
+pub const GroupKind = union(enum) {
+    default,
+    global,
+    inherited,
+    named: []const u8,
+};
+
+pub fn Group(comptime T: type) type {
+    return struct {
+        items: []const T,
+        kind: GroupKind,
+    };
+}
+
+pub fn HelpContext(comptime RootCommand: type) type {
+    return struct {
+        app: AppOptions(RootCommand),
+        command: CommandHelpEntry,
+        command_path: []const u8,
+        max_option_width: u16,
+        max_subcommand_width: u16,
+        option_groups: []const Group(OptionHelpEntry),
+        subcommand_groups: []const Group(SubcommandHelpEntry),
+        terminal_width: u16,
     };
 }
 
@@ -124,9 +258,37 @@ pub fn Option(comptime RootCommand: type) type {
     return @Enum(u32, .exhaustive, &field_names, &field_values);
 }
 
+pub const OptionError = struct {
+    command_path: []const u8,
+    kind: Kind,
+    message: []const u8,
+    option_name: []const u8,
+
+    pub const Kind = union(enum) {
+        invalid_value,
+        missing_required,
+        missing_value,
+        mutually_exclusive: struct { related_option_name: []const u8 },
+        unmet_dependency: struct { related_option_name: []const u8 },
+    };
+};
+
+pub const OptionHelpEntry = struct {
+    default_text: ?[]const u8 = null,
+    deprecated: ?[]const u8 = null,
+    hidden: bool = false,
+    long: []const u8,
+    required: bool = false,
+    short: ?u8 = null,
+    summary: ?[]const u8 = null,
+    value_label: ?[]const u8 = null,
+};
+
 pub fn OptionInfo(comptime RootCommand: type, comptime OptionGroup: type) type {
     return struct {
+        complete: Completer(RootCommand) = null,
         default_text: ?[]const u8 = null,
+        depends_on: []const Option(RootCommand) = &.{},
         deprecated: ?[]const u8 = null,
         env_var: ?[]const u8 = null,
         group: ?OptionGroup = null,
@@ -136,13 +298,23 @@ pub fn OptionInfo(comptime RootCommand: type, comptime OptionGroup: type) type {
         long_aliases: []const []const u8 = &.{},
         mutually_exclusive_with: []const Option(RootCommand) = &.{},
         required: bool = false,
-        requires: []const Option(RootCommand) = &.{},
         short: ?u8 = null,
         show_default: ?bool = null,
         summary: ?[]const u8 = null,
         value_label: ?[]const u8 = null,
     };
 }
+
+pub const OptionWarning = struct {
+    command_path: []const u8,
+    message: []const u8,
+    option_name: []const u8,
+};
+
+pub const ParseResult = union(enum) {
+    err: ErrorResult,
+    ok: SuccessResult,
+};
 
 pub fn Subcommand(comptime RootCommand: type) type {
     const count = find_subcommands(RootCommand, "");
@@ -153,9 +325,31 @@ pub fn Subcommand(comptime RootCommand: type) type {
     return @Enum(u16, .exhaustive, &field_names, &field_values);
 }
 
+pub const SubcommandHelpEntry = struct {
+    deprecated: ?[]const u8 = null,
+    hidden: bool = false,
+    name: []const u8,
+    summary: ?[]const u8 = null,
+};
+
+pub fn SuccessResult(comptime RootCommand: type) type {
+    return struct {
+        args: []const []const u8,
+        invoked_command: InvokedCommand(RootCommand),
+        root: *RootCommand,
+        unmatched_short_options: ?[]const u8,
+        warnings: []const Warning,
+    };
+}
+
 pub const Usage = union(enum) {
     args: []const u8,
     full_text: []const u8,
+};
+
+pub const Warning = union(enum) {
+    command: CommandWarning,
+    option: OptionWarning,
 };
 
 fn construct_command_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u16, next: *usize) void {
@@ -322,15 +516,17 @@ const MyApp = struct {
 };
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-    var app = try App(MyApp).init(allocator, .{});
+    var app = try App(MyApp).init(.{
+        .name = "kickass",
+    });
     defer app.deinit();
+
     app.subcommand(.Foo, .{ .summary = "Foo command" });
     app.option(.spam, .{ .summary = "option" });
     app.option(.Foo_Bar_hello, .{ .summary = "option" });
-    switch (app.invoked_command) {
+
+    const result = app.parse();
+    switch (result.invoked_command) {
         .Default => {
             std.debug.print("Default\n", .{});
         },
