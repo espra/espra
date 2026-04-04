@@ -49,23 +49,20 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
     if (OptionGroup != void and @typeInfo(OptionGroup) != .@"enum") {
         @compileError("OptionGroup must be an enum type");
     }
+    const AppOpts = AppOptions(RootCommand);
     return struct {
         arena: std.heap.ArenaAllocator,
-        args: []const []const u8,
         backing_allocator: ?*std.heap.DebugAllocator(.{}),
-        invoked_command: InvokedCommand(RootCommand),
-        options: AppOptions(RootCommand),
-        root: *RootCommand,
-        unmatched_short_options: ?[]const u8,
+        options: AppOpts,
 
         const Self = @This();
 
-        pub fn init(options: AppOptions(RootCommand)) !Self {
+        pub fn init(options: AppOptions(RootCommand)) *Self {
             var backing_allocator: ?*std.heap.DebugAllocator(.{}) = if (builtin.mode == .Debug) blk: {
                 if (options.allocator != null) {
                     break :blk null;
                 }
-                const raw = try std.heap.page_allocator.create(std.heap.DebugAllocator(.{}));
+                const raw = std.heap.page_allocator.create(std.heap.DebugAllocator(.{})) catch oom(options.name);
                 raw.* = .init;
                 break :blk raw;
             } else null;
@@ -73,25 +70,23 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
                 backing_allocator.?.allocator()
             else
                 std.heap.smp_allocator;
-            var arena = std.heap.ArenaAllocator.init(allocator);
-            errdefer arena.deinit();
-            const root = try arena.allocator().create(RootCommand);
-            return .{
-                .arena = arena,
-                .args = &.{},
+            const self = allocator.create(Self) catch oom(options.name);
+            self.* = .{
+                .arena = std.heap.ArenaAllocator.init(allocator),
                 .backing_allocator = backing_allocator,
-                .invoked_command = .Default,
                 .options = options,
-                .root = root,
-                .unmatched_short_options = null,
             };
+            return self;
         }
 
         pub fn deinit(self: *Self) void {
+            const allocator = self.arena.child_allocator;
+            const backing = self.backing_allocator;
             self.arena.deinit();
-            if (self.backing_allocator) |allocator| {
-                _ = allocator.deinit();
-                std.heap.page_allocator.destroy(allocator);
+            allocator.destroy(self);
+            if (backing) |backing_allocator| {
+                _ = backing_allocator.deinit();
+                std.heap.page_allocator.destroy(backing_allocator);
             }
         }
 
@@ -104,11 +99,12 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
         pub fn parse(self: *Self) SuccessResult(RootCommand) {
             // const args = try std.process.argsAlloc(allocator);
             // defer std.process.argsFree(allocator, args);
-            // _ = self;
+            _ = self;
             return .{
                 .args = &.{},
                 .invoked_command = .Default,
-                .root = self.root,
+                .root = undefined,
+                // .root = self.root,
                 .unmatched_short_options = null,
                 .warnings = &.{},
             };
@@ -380,6 +376,18 @@ fn construct_option_enum(comptime T: type, comptime prefix: []const u8, field_na
     }
 }
 
+fn exit_error(app_name: []const u8, message: []const u8) noreturn {
+    std.debug.print("\x1b[31m!! ERROR: {s}: {s} !!\x1b[0m\n", .{ app_name, message });
+    std.process.exit(1);
+}
+
+fn exit_errorf(app_name: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("\x1b[31m!! ERROR: {s}: ", .{app_name});
+    std.debug.print(fmt, args);
+    std.debug.print("\x1b[0m\n", .{});
+    std.process.exit(1);
+}
+
 fn find_options(comptime T: type, comptime prefix: []const u8) usize {
     const fields = switch (@typeInfo(T)) {
         .@"struct" => |info| info.fields,
@@ -410,6 +418,10 @@ fn find_subcommands(comptime T: type, comptime prefix: []const u8) usize {
         count += find_subcommands(field.type, prefix ++ "." ++ field.name);
     }
     return count;
+}
+
+fn oom(app_name: []const u8) noreturn {
+    exit_error(app_name, "out of memory (OOM)");
 }
 
 fn pascal_to_kebab(comptime ident: []const u8) []const u8 {
@@ -516,7 +528,7 @@ const MyApp = struct {
 };
 
 pub fn main() !void {
-    var app = try App(MyApp).init(.{
+    var app = App(MyApp).init(.{
         .name = "kickass",
     });
     defer app.deinit();
