@@ -7,17 +7,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const EnumField = std.builtin.Type.EnumField;
 
-pub const ParseError = error{
-    InvalidOption,
-    InvalidSubcommand,
-    MissingRequired,
-};
-
 const min_terminal_width: u16 = 80;
+
+pub fn App(comptime RootCommand: type) type {
+    return AppWithGroups(RootCommand, void, void);
+}
 
 pub fn AppOptions(comptime RootCommand: type) type {
     return struct {
-        allocator: ?Allocator = null,
         complete: Completer(RootCommand) = null,
         description: ?[]const u8 = null,
         enable_completion_command: bool = false,
@@ -38,10 +35,6 @@ pub fn AppOptions(comptime RootCommand: type) type {
     };
 }
 
-pub fn App(comptime RootCommand: type) type {
-    return AppWithGroups(RootCommand, void, void);
-}
-
 pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, comptime OptionGroup: type) type {
     if (CommandGroup != void and @typeInfo(CommandGroup) != .@"enum") {
         @compileError("CommandGroup must be an enum type");
@@ -49,75 +42,82 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
     if (OptionGroup != void and @typeInfo(OptionGroup) != .@"enum") {
         @compileError("OptionGroup must be an enum type");
     }
-    const AppOpts = AppOptions(RootCommand);
+    const subcommands_count = find_subcommands(RootCommand, "");
+    const options_count = find_options(RootCommand, "");
     return struct {
-        arena: std.heap.ArenaAllocator,
-        backing_allocator: ?*std.heap.DebugAllocator(.{}),
-        options: AppOpts,
+        app_options: AppOptions(RootCommand),
+        options: [options_count]?OptionInfo(RootCommand, OptionGroup),
+        require_explicit: bool,
+        subcommands: [subcommands_count]?CommandInfo(RootCommand, CommandGroup),
 
         const Self = @This();
 
-        pub fn init(options: AppOptions(RootCommand)) *Self {
-            var backing_allocator: ?*std.heap.DebugAllocator(.{}) = if (builtin.mode == .Debug) blk: {
-                if (options.allocator != null) {
-                    break :blk null;
-                }
-                const raw = std.heap.page_allocator.create(std.heap.DebugAllocator(.{})) catch oom(options.name);
-                raw.* = .init;
-                break :blk raw;
-            } else null;
-            const allocator = options.allocator orelse if (builtin.mode == .Debug)
-                backing_allocator.?.allocator()
-            else
-                std.heap.smp_allocator;
-            const self = allocator.create(Self) catch oom(options.name);
-            self.* = .{
-                .arena = std.heap.ArenaAllocator.init(allocator),
-                .backing_allocator = backing_allocator,
-                .options = options,
+        pub fn init(options: AppOptions(RootCommand)) Self {
+            return .{
+                .app_options = options,
+                .options = .{null} ** options_count,
+                .require_explicit = false,
+                .subcommands = .{null} ** subcommands_count,
             };
-            return self;
-        }
-
-        pub fn deinit(self: *Self) void {
-            const allocator = self.arena.child_allocator;
-            const backing = self.backing_allocator;
-            self.arena.deinit();
-            allocator.destroy(self);
-            if (backing) |backing_allocator| {
-                _ = backing_allocator.deinit();
-                std.heap.page_allocator.destroy(backing_allocator);
-            }
         }
 
         pub fn option(self: *Self, opt: Option(RootCommand), info: OptionInfo(RootCommand, OptionGroup)) void {
-            _ = self;
-            _ = opt;
-            _ = info;
+            self.options[@intFromEnum(opt)] = info;
         }
 
-        pub fn parse(self: *Self) SuccessResult(RootCommand) {
-            // const args = try std.process.argsAlloc(allocator);
-            // defer std.process.argsFree(allocator, args);
+        pub fn parse(self: *Self, proc: std.process.Init) SuccessResult(RootCommand) {
+            const arena = proc.gpa.create(std.heap.ArenaAllocator) catch oom(self.app_options.name);
+            arena.* = std.heap.ArenaAllocator.init(proc.gpa);
+            const allocator = arena.allocator();
+            const raw_args = proc.minimal.args.toSlice(allocator) catch oom(self.app_options.name);
+            const args = if (raw_args.len > 0) raw_args[1..] else raw_args;
+            const result = self.parse_raw(arena, args);
+            switch (result) {
+                .ok => |r| {
+                    for (r.warnings) |w| {
+                        self.print_warning(w);
+                    }
+                    return r;
+                },
+                .err => |e| {
+                    self.print_error(e);
+                    std.process.exit(1);
+                },
+            }
+        }
+
+        pub fn parse_raw(self: *Self, arena: *std.heap.ArenaAllocator, args: []const []const u8) ParseResult(RootCommand) {
+            // const allocator = arena.allocator();
             _ = self;
+            _ = args;
             return .{
-                .args = &.{},
-                .invoked_command = .Default,
-                .root = undefined,
-                // .root = self.root,
-                .unmatched_short_options = null,
-                .warnings = &.{},
+                .ok = .{
+                    .arena = arena,
+                    .args = &.{},
+                    .invoked_command = .Default,
+                    .root = undefined,
+                    .unmatched_short_options = null,
+                    .warnings = &.{},
+                },
             };
         }
 
         pub fn require_explicit_definitions(self: *Self) void {
-            _ = self;
+            self.require_explicit = true;
         }
 
         pub fn subcommand(self: *Self, cmd: Subcommand(RootCommand), info: CommandInfo(RootCommand, CommandGroup)) void {
+            self.subcommands[@intFromEnum(cmd)] = info;
+        }
+
+        fn print_warning(self: *Self, warning: Warning) void {
             _ = self;
-            _ = cmd;
-            _ = info;
+            _ = warning;
+        }
+
+        fn print_error(self: *Self, err: ErrorResult) void {
+            _ = self;
+            _ = err;
         }
     };
 }
@@ -307,10 +307,12 @@ pub const OptionWarning = struct {
     option_name: []const u8,
 };
 
-pub const ParseResult = union(enum) {
-    err: ErrorResult,
-    ok: SuccessResult,
-};
+pub fn ParseResult(comptime RootCommand: type) type {
+    return union(enum) {
+        err: ErrorResult,
+        ok: SuccessResult(RootCommand),
+    };
+}
 
 pub fn Subcommand(comptime RootCommand: type) type {
     const count = find_subcommands(RootCommand, "");
@@ -330,11 +332,18 @@ pub const SubcommandHelpEntry = struct {
 
 pub fn SuccessResult(comptime RootCommand: type) type {
     return struct {
+        arena: *std.heap.ArenaAllocator,
         args: []const []const u8,
         invoked_command: InvokedCommand(RootCommand),
         root: *RootCommand,
         unmatched_short_options: ?[]const u8,
         warnings: []const Warning,
+
+        pub fn deinit(self: *@This()) void {
+            const backing = self.arena.child_allocator;
+            self.arena.deinit();
+            backing.destroy(self.arena);
+        }
     };
 }
 
@@ -377,12 +386,12 @@ fn construct_option_enum(comptime T: type, comptime prefix: []const u8, field_na
 }
 
 fn exit_error(app_name: []const u8, message: []const u8) noreturn {
-    std.debug.print("\x1b[31m!! ERROR: {s}: {s} !!\x1b[0m\n", .{ app_name, message });
+    std.debug.print("\x1b[31mERROR: {s}: {s}\x1b[0m\n", .{ app_name, message });
     std.process.exit(1);
 }
 
 fn exit_errorf(app_name: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
-    std.debug.print("\x1b[31m!! ERROR: {s}: ", .{app_name});
+    std.debug.print("\x1b[31mERROR: {s}: ", .{app_name});
     std.debug.print(fmt, args);
     std.debug.print("\x1b[0m\n", .{});
     std.process.exit(1);
@@ -421,7 +430,7 @@ fn find_subcommands(comptime T: type, comptime prefix: []const u8) usize {
 }
 
 fn oom(app_name: []const u8) noreturn {
-    exit_error(app_name, "out of memory (OOM)");
+    exit_error(app_name, "out of memory");
 }
 
 fn pascal_to_kebab(comptime ident: []const u8) []const u8 {
@@ -527,17 +536,18 @@ const MyApp = struct {
     spam: bool,
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var app = App(MyApp).init(.{
         .name = "kickass",
     });
-    defer app.deinit();
 
     app.subcommand(.Foo, .{ .summary = "Foo command" });
     app.option(.spam, .{ .summary = "option" });
     app.option(.Foo_Bar_hello, .{ .summary = "option" });
 
-    const result = app.parse();
+    var result = app.parse(init);
+    defer result.deinit();
+
     switch (result.invoked_command) {
         .Default => {
             std.debug.print("Default\n", .{});
