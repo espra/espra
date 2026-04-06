@@ -15,7 +15,7 @@ pub fn App(comptime RootCommand: type) type {
 
 pub fn AppOptions(comptime RootCommand: type) type {
     return struct {
-        complete: Completer(RootCommand) = null,
+        complete: ?Completer(RootCommand) = null,
         description: ?[]const u8 = null,
         enable_completion_command: bool = false,
         enable_help_command: bool = false,
@@ -32,28 +32,49 @@ pub fn AppOptions(comptime RootCommand: type) type {
         preserve_unmatched_short_options: bool = false,
         prolog: ?[]const u8 = null,
         show_defaults: ?bool = null,
+        subcommands_only: bool = false,
         summary: ?[]const u8 = null,
         usage: ?Usage = null,
         version: ?[]const u8 = null,
     };
 }
 
-pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, comptime OptionGroup: type) type {
-    if (CommandGroup != void and @typeInfo(CommandGroup) != .@"enum") {
-        @compileError("CommandGroup must be an enum type");
+pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type, comptime OptionGroup: type) type {
+    if (SubcommandGroup != void and @typeInfo(SubcommandGroup) != .@"enum") {
+        @compileError("SubcommandGroup must be an enum type");
     }
     if (OptionGroup != void and @typeInfo(OptionGroup) != .@"enum") {
         @compileError("OptionGroup must be an enum type");
     }
     const subcommands_count = find_subcommands(RootCommand, "");
     const options_count = find_options(RootCommand, "");
+
+    const ResolvedCommand = struct {
+        aliases: []const Subcommand(RootCommand),
+        complete: ?Completer(RootCommand),
+        deprecated: ?[]const u8,
+        description: ?[]const u8,
+        epilog: ?[]const u8,
+        group: ?SubcommandGroup,
+        hidden: bool,
+        max_args: ?usize,
+        min_args: ?usize,
+        name: ?[]const u8,
+        preserve_unmatched_short_options: bool,
+        prolog: ?[]const u8,
+        struct_path: []const u8,
+        subcommands_only: bool,
+        summary: ?[]const u8,
+        usage: ?Usage,
+    };
+
     return struct {
         app_options: AppOptions(RootCommand),
         option_names: [options_count][]const u8,
         options: [options_count]?OptionInfo(RootCommand, OptionGroup),
         require_explicit: bool,
         subcommand_names: [subcommands_count][]const u8,
-        subcommands: [subcommands_count]?CommandInfo(RootCommand, CommandGroup),
+        subcommands: [subcommands_count]?SubcommandInfo(RootCommand, SubcommandGroup),
 
         const Self = @This();
 
@@ -62,7 +83,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
             comptime var option_names: [options_count][]const u8 = undefined;
             comptime var subcommand_idx: usize = 0;
             comptime var subcommand_names: [subcommands_count][]const u8 = undefined;
-            comptime collect_field_names(RootCommand, @typeName(RootCommand), &option_idx, &option_names, &subcommand_idx, &subcommand_names);
+            comptime collect_field_names(RootCommand, unqualified_type_name(RootCommand), &option_idx, &option_names, &subcommand_idx, &subcommand_names);
 
             return .{
                 .app_options = options,
@@ -75,7 +96,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
         }
 
         pub fn option(self: *Self, opt: Option(RootCommand), info: OptionInfo(RootCommand, OptionGroup)) void {
-            self.options[@intFromEnum(opt)] = info;
+            self.options[@intFromEnum(opt) & 0xFFFFFFFF] = info;
         }
 
         pub fn parse(self: *Self, proc: std.process.Init) SuccessResult(RootCommand) {
@@ -113,9 +134,14 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
             if (self.require_explicit) {
                 if (self.check_explicit_definitions()) |err| {
                     return .{
-                        .err = .{ .definition = err },
+                        .err = .{ .missing_definition = err },
                     };
                 }
+            }
+            if (self.validate_definitions(allocator)) |err| {
+                return .{
+                    .err = .{ .validation = err },
+                };
             }
             _ = args;
             return .{
@@ -150,8 +176,8 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
             self.require_explicit = true;
         }
 
-        pub fn subcommand(self: *Self, cmd: Subcommand(RootCommand), info: CommandInfo(RootCommand, CommandGroup)) void {
-            self.subcommands[@intFromEnum(cmd)] = info;
+        pub fn subcommand(self: *Self, cmd: Subcommand(RootCommand), info: SubcommandInfo(RootCommand, SubcommandGroup)) void {
+            self.subcommands[(@intFromEnum(cmd) & 0xFFFF) - 1] = info;
         }
 
         fn build_help_context(self: *Self, cmd: InvokedCommand(RootCommand)) HelpContext(RootCommand) {
@@ -174,7 +200,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
             };
         }
 
-        fn check_explicit_definitions(self: *Self) ?DefinitionError {
+        fn check_explicit_definitions(self: *Self) ?MissingDefinitionError {
             for (0..subcommands_count) |i| {
                 if (self.subcommands[i] == null) {
                     return .{ .subcommand = self.subcommand_names[i] };
@@ -215,14 +241,106 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
             _ = shell;
         }
 
+        fn validate_definitions(self: *Self, allocator: Allocator) ?ValidationError {
+            var foo: std.AutoHashMapUnmanaged(u8, void) = .empty;
+            for (self.subcommands, 0..) |s, i| if (s) |info| {
+                if (info.name) |name| {
+                    if (name.len == 0) {
+                        return .{
+                            .subcommand = .{
+                                .message = "`name` is an empty string",
+                                .subcommand_name = self.subcommand_names[i],
+                            },
+                        };
+                    }
+                }
+                if (info.subcommands_only) {
+                    if (info.min_args) |min_args| {
+                        if (min_args > 0) {
+                            return .{
+                                .subcommand = .{
+                                    .message = "cannot set both `subcommands_only` and `min_args`",
+                                    .subcommand_name = self.subcommand_names[i],
+                                },
+                            };
+                        }
+                    }
+                    if (info.max_args) |max_args| {
+                        if (max_args > 0) {
+                            return .{
+                                .subcommand = .{
+                                    .message = "cannot set both `subcommands_only` and `max_args`",
+                                    .subcommand_name = self.subcommand_names[i],
+                                },
+                            };
+                        }
+                    }
+                }
+            };
+            for (self.options, 0..) |o, i| if (o) |info| {
+                if (info.long) |long| {
+                    if (long.len == 0) {
+                        return .{
+                            .option = .{
+                                .message = "`long` is an empty string",
+                                .option_name = self.option_names[i],
+                            },
+                        };
+                    }
+                    if (long.len == 1) {
+                        return .{
+                            .option = .{
+                                .message = "`long` is a single character",
+                                .option_name = self.option_names[i],
+                            },
+                        };
+                    }
+                    if (long[0] == '-') {
+                        return .{
+                            .option = .{
+                                .message = "`long` starts with a hyphen",
+                                .option_name = self.option_names[i],
+                            },
+                        };
+                    }
+                    if (is_invalid_long_flag(long)) |char| {
+                        return .{
+                            .option = .{
+                                .message = std.fmt.allocPrint(allocator, "`long` contains an invalid character: \"{c}\" (0x{x})", .{ char, char }) catch oom(self.app_options.name),
+                                .option_name = self.option_names[i],
+                            },
+                        };
+                    }
+                }
+                if (info.short) |short| {
+                    if (is_invalid_short_flag(short)) {
+                        return .{
+                            .option = .{
+                                .message = std.fmt.allocPrint(allocator, "`short` value is invalid: \"{c}\" (0x{x})", .{ short, short }) catch oom(self.app_options.name),
+                                .option_name = self.option_names[i],
+                            },
+                        };
+                    }
+                }
+            };
+
+            // depends_on value {}
+            // mutually_exclusive_with value {}
+            // field {} needs to either be required or have a default value
+
+            // Subcommands:
+            // name conflicts with [ name inferred | name set ]
+            return null;
+        }
+
         fn default_print_deprecations(allocator: Allocator, w: *std.Io.Writer, app_name: []const u8, deprecations: []const Deprecation) !void {
             _ = allocator;
             for (deprecations) |deprecation| switch (deprecation) {
-                .command => |cmd| {
-                    try w.print("\x1b[31mWARNING: {s}: deprecated subcommand \"{s}\", {s}\x1b[0m\n", .{ app_name, cmd.command_path, cmd.message });
-                },
                 .option => |opt| {
                     try w.print("\x1b[31mWARNING: {s}: deprecated option \"{s}\" for \"{s}\", {s}\x1b[0m\n", .{ app_name, opt.option_name, opt.command_path, opt.message });
+                },
+                .subcommand => |cmd| {
+                    try w.print("\x1b[31mWARNING: {s}: deprecated subcommand \"{s}\", {s}\x1b[0m\n", .{ app_name, cmd.command_path, cmd.message });
                 },
             };
             try w.flush();
@@ -232,7 +350,10 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
             _ = allocator;
             try w.print("\x1b[31mERROR: {s}: ", .{app_name});
             switch (err) {
-                .definition => |definition| switch (definition) {
+                .command => |cmd_err| {
+                    try w.print("command error: {s} ", .{cmd_err.command_path});
+                },
+                .missing_definition => |definition| switch (definition) {
                     .option => |option_name| {
                         try w.print("missing explicit definition for option: {s} ", .{option_name});
                     },
@@ -240,11 +361,16 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime CommandGroup: type, co
                         try w.print("missing explicit definition for subcommand: {s} ", .{subcommand_name});
                     },
                 },
-                .command => |cmd_err| {
-                    try w.print("command error: {s} ", .{cmd_err.command_path});
-                },
                 .option => |opt_err| {
                     try w.print("option error: {s} ", .{opt_err.option_name});
+                },
+                .validation => |validation| switch (validation) {
+                    .option => |v| {
+                        try w.print("invalid option definition for {s}: {s} ", .{ v.option_name, v.message });
+                    },
+                    .subcommand => |v| {
+                        try w.print("invalid subcommand definition for {s}: {s} ", .{ v.subcommand_name, v.message });
+                    },
                 },
             }
             try w.print("\x1b[0m\n", .{});
@@ -280,43 +406,24 @@ pub const CommandHelpEntry = struct {
     usage: ?[]const u8 = null,
 };
 
-pub fn CommandInfo(comptime RootCommand: type, comptime CommandGroup: type) type {
-    return struct {
-        aliases: []const Subcommand(RootCommand) = &.{},
-        complete: Completer(RootCommand) = null,
-        deprecated: ?[]const u8 = null,
-        description: ?[]const u8 = null,
-        epilog: ?[]const u8 = null,
-        group: ?CommandGroup = null,
-        hidden: bool = false,
-        max_args: ?usize = null,
-        min_args: ?usize = null,
-        name: ?[]const u8 = null,
-        preserve_unmatched_short_options: bool = false,
-        prolog: ?[]const u8 = null,
-        summary: ?[]const u8 = null,
-        usage: ?Usage = null,
-    };
-}
-
-pub const DeprecatedCommand = struct {
-    command_path: []const u8,
-    message: []const u8,
-};
-
 pub const DeprecatedOption = struct {
     command_path: []const u8,
     message: []const u8,
     option_name: []const u8,
 };
 
+pub const DeprecatedSubcommand = struct {
+    command_path: []const u8,
+    message: []const u8,
+};
+
 pub const Deprecation = union(enum) {
-    command: DeprecatedCommand,
     option: DeprecatedOption,
+    subcommand: DeprecatedSubcommand,
 };
 
 pub fn Completer(comptime RootCommand: type) type {
-    return ?*const fn (
+    return *const fn (
         allocator: Allocator,
         root: *const RootCommand,
         invoked_command: InvokedCommand(RootCommand),
@@ -336,15 +443,11 @@ pub fn DecodeResult(comptime T: type) type {
     };
 }
 
-pub const DefinitionError = union(enum) {
-    option: []const u8,
-    subcommand: []const u8,
-};
-
 pub const ErrorResult = union(enum) {
     command: CommandError,
-    definition: DefinitionError,
+    missing_definition: MissingDefinitionError,
     option: OptionError,
+    validation: ValidationError,
 };
 
 pub const GroupKind = union(enum) {
@@ -377,21 +480,29 @@ pub fn HelpContext(comptime RootCommand: type) type {
 pub fn InvokedCommand(comptime RootCommand: type) type {
     const count = find_subcommands(RootCommand, "") + 1;
     comptime var field_names: [count][]const u8 = undefined;
-    comptime var field_values: [count]u16 = undefined;
-    comptime var i: usize = 1;
+    comptime var field_values: [count]u32 = undefined;
+    comptime var idx: usize = 1;
+    comptime var cmd: usize = 1;
+    comptime var parent: usize = 0;
     field_names[0] = "Default";
     field_values[0] = 0;
-    construct_command_enum(RootCommand, "", &field_names, &field_values, &i);
-    return @Enum(u16, .exhaustive, &field_names, &field_values);
+    construct_command_enum(RootCommand, "", &field_names, &field_values, &idx, &cmd, &parent);
+    return @Enum(u32, .exhaustive, &field_names, &field_values);
 }
+
+pub const MissingDefinitionError = union(enum) {
+    option: []const u8,
+    subcommand: []const u8,
+};
 
 pub fn Option(comptime RootCommand: type) type {
     const count = find_options(RootCommand, "");
     comptime var field_names: [count][]const u8 = undefined;
-    comptime var field_values: [count]u32 = undefined;
-    comptime var i: usize = 0;
-    construct_option_enum(RootCommand, "", &field_names, &field_values, &i);
-    return @Enum(u32, .exhaustive, &field_names, &field_values);
+    comptime var field_values: [count]u64 = undefined;
+    comptime var idx: usize = 0;
+    comptime var cmd: u16 = 0;
+    construct_option_enum(RootCommand, "", &field_names, &field_values, &idx, &cmd);
+    return @Enum(u64, .exhaustive, &field_names, &field_values);
 }
 
 pub const OptionError = struct {
@@ -421,7 +532,7 @@ pub const OptionHelpEntry = struct {
 
 pub fn OptionInfo(comptime RootCommand: type, comptime OptionGroup: type) type {
     return struct {
-        complete: Completer(RootCommand) = null,
+        complete: ?Completer(RootCommand) = null,
         default_text: ?[]const u8 = null,
         depends_on: []const Option(RootCommand) = &.{},
         deprecated: ?[]const u8 = null,
@@ -450,10 +561,12 @@ pub fn ParseResult(comptime RootCommand: type) type {
 pub fn Subcommand(comptime RootCommand: type) type {
     const count = find_subcommands(RootCommand, "");
     comptime var field_names: [count][]const u8 = undefined;
-    comptime var field_values: [count]u16 = undefined;
-    comptime var i: usize = 0;
-    construct_command_enum(RootCommand, "", &field_names, &field_values, &i);
-    return @Enum(u16, .exhaustive, &field_names, &field_values);
+    comptime var field_values: [count]u32 = undefined;
+    comptime var idx: usize = 0;
+    comptime var cmd: usize = 1;
+    comptime var parent: usize = 0;
+    construct_command_enum(RootCommand, "", &field_names, &field_values, &idx, &cmd, &parent);
+    return @Enum(u32, .exhaustive, &field_names, &field_values);
 }
 
 pub const SubcommandHelpEntry = struct {
@@ -462,6 +575,26 @@ pub const SubcommandHelpEntry = struct {
     name: []const u8,
     summary: ?[]const u8 = null,
 };
+
+pub fn SubcommandInfo(comptime RootCommand: type, comptime SubcommandGroup: type) type {
+    return struct {
+        aliases: []const Subcommand(RootCommand) = &.{},
+        complete: ?Completer(RootCommand) = null,
+        deprecated: ?[]const u8 = null,
+        description: ?[]const u8 = null,
+        epilog: ?[]const u8 = null,
+        group: ?SubcommandGroup = null,
+        hidden: bool = false,
+        max_args: ?usize = null,
+        min_args: ?usize = null,
+        name: ?[]const u8 = null,
+        preserve_unmatched_short_options: bool = false,
+        prolog: ?[]const u8 = null,
+        subcommands_only: bool = false,
+        summary: ?[]const u8 = null,
+        usage: ?Usage = null,
+    };
+}
 
 pub fn SuccessResult(comptime RootCommand: type) type {
     return struct {
@@ -485,6 +618,17 @@ pub const Usage = union(enum) {
     full_text: []const u8,
 };
 
+pub const ValidationError = union(enum) {
+    option: struct {
+        message: []const u8,
+        option_name: []const u8,
+    },
+    subcommand: struct {
+        message: []const u8,
+        subcommand_name: []const u8,
+    },
+};
+
 fn collect_field_names(comptime T: type, comptime prefix: []const u8, option_idx: *usize, option_names: [][]const u8, subcommand_idx: *usize, subcommand_names: [][]const u8) void {
     inline for (std.meta.fields(T)) |field| {
         if (std.ascii.isUpper(field.name[0])) {
@@ -500,28 +644,31 @@ fn collect_field_names(comptime T: type, comptime prefix: []const u8, option_idx
     }
 }
 
-fn construct_command_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u16, next: *usize) void {
+fn construct_command_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u32, idx: *usize, cmd: *usize, parent: *usize) void {
     for (std.meta.fields(T)) |field| {
         if (!std.ascii.isUpper(field.name[0])) {
             continue;
         }
         const name = if (prefix.len == 0) field.name else prefix ++ "_" ++ field.name;
-        field_names[next.*] = name;
-        field_values[next.*] = next.*;
-        next.* += 1;
-        construct_command_enum(field.type, name, field_names, field_values, next);
+        field_names[idx.*] = name;
+        field_values[idx.*] = @as(u32, parent.*) << 16 | @as(u32, cmd.*);
+        parent.* = cmd.*;
+        cmd.* += 1;
+        idx.* += 1;
+        construct_command_enum(field.type, name, field_names, field_values, idx, cmd, parent);
     }
 }
 
-fn construct_option_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u32, next: *usize) void {
-    for (std.meta.fields(T)) |field| {
+fn construct_option_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u64, idx: *usize, cmd: *u16) void {
+    for (std.meta.fields(T), 0..) |field, i| {
         if (std.ascii.isUpper(field.name[0])) {
             const name = if (prefix.len == 0) field.name ++ "_" else prefix ++ field.name ++ "_";
-            construct_option_enum(field.type, name, field_names, field_values, next);
+            cmd.* += 1;
+            construct_option_enum(field.type, name, field_names, field_values, idx, cmd);
         } else {
-            field_names[next.*] = prefix ++ field.name;
-            field_values[next.*] = next.*;
-            next.* += 1;
+            field_names[idx.*] = prefix ++ field.name;
+            field_values[idx.*] = @as(u64, cmd.*) << 48 | @as(u64, i) << 32 | idx.*;
+            idx.* += 1;
         }
     }
 }
@@ -539,15 +686,21 @@ fn exit_errorf(app_name: []const u8, comptime fmt: []const u8, args: anytype) no
 }
 
 fn find_options(comptime T: type, comptime prefix: []const u8) usize {
+    if (prefix.len == 0) {
+        return find_options(T, unqualified_type_name(T));
+    }
     const fields = switch (@typeInfo(T)) {
         .@"struct" => |info| info.fields,
-        else => @compileError("Expected struct type for RootCommand" ++ prefix ++ ", got " ++ @typeName(T)),
+        else => @compileError("RootCommand " ++ prefix ++ " needs to be a struct, not " ++ @typeName(T)),
     };
     var count: usize = 0;
     for (fields) |field| {
         if (std.ascii.isUpper(field.name[0])) {
             count += find_options(field.type, prefix ++ "." ++ field.name);
         } else {
+            if (std.mem.startsWith(u8, field.name, "_")) {
+                @compileError("RootCommand option field " ++ prefix ++ "." ++ field.name ++ " starts with an underscore");
+            }
             count += 1;
         }
     }
@@ -555,9 +708,12 @@ fn find_options(comptime T: type, comptime prefix: []const u8) usize {
 }
 
 fn find_subcommands(comptime T: type, comptime prefix: []const u8) usize {
+    if (prefix.len == 0) {
+        return find_subcommands(T, unqualified_type_name(T));
+    }
     const fields = switch (@typeInfo(T)) {
         .@"struct" => |info| info.fields,
-        else => @compileError("Expected struct type for RootCommand" ++ prefix ++ ", got " ++ @typeName(T)),
+        else => @compileError("RootCommand " ++ prefix ++ " needs to be a struct, not " ++ @typeName(T)),
     };
     var count: usize = 0;
     for (fields) |field| {
@@ -568,6 +724,38 @@ fn find_subcommands(comptime T: type, comptime prefix: []const u8) usize {
         count += find_subcommands(field.type, prefix ++ "." ++ field.name);
     }
     return count;
+}
+
+fn is_invalid_long_flag(long: []const u8) ?u8 {
+    for (long) |c| {
+        if (c >= 'a' and c <= 'z') {
+            continue;
+        }
+        if (c >= 'A' and c <= 'Z') {
+            continue;
+        }
+        if (c >= '0' and c <= '9') {
+            continue;
+        }
+        if (c == '-') {
+            continue;
+        }
+        return c;
+    }
+    return null;
+}
+
+fn is_invalid_short_flag(short: u8) bool {
+    if (short >= 'a' and short <= 'z') {
+        return false;
+    }
+    if (short >= 'A' and short <= 'Z') {
+        return false;
+    }
+    if (short >= '0' and short <= '9') {
+        return false;
+    }
+    return true;
 }
 
 fn oom(app_name: []const u8) noreturn {
@@ -612,6 +800,11 @@ fn snake_to_kebab(comptime ident: []const u8) []const u8 {
         const result = buf;
         return &result;
     }
+}
+
+fn unqualified_type_name(comptime T: type) []const u8 {
+    const name = @typeName(T);
+    return if (std.mem.lastIndexOfScalar(u8, name, '.')) |idx| name[idx + 1 ..] else name;
 }
 
 const testing = std.testing;
@@ -682,12 +875,26 @@ pub fn main(init: std.process.Init) !void {
         .name = "kickass",
     });
 
-    app.subcommand(.Foo, .{ .summary = "Foo command" });
-    app.option(.Foo_baz, .{ .summary = "option" });
+    // const fields = std.meta.tags(Option(MyApp));
+    // for (fields) |field| {
+    //     std.debug.print("{s}\t{d}\t{d}\n", .{ @tagName(field), @intFromEnum(field), @intFromEnum(field) & 0xFFFFFFFF });
+    // }
+
+    app.subcommand(.Foo, .{
+        .summary = "Foo command",
+        .name = "fx",
+        // .subcommands_only = true,
+        // .max_args = 1,
+    });
+    // app.option(.Foo_baz, .{ .summary = "option" });
     app.subcommand(.Foo_Bar, .{ .summary = "Foo Bar command" });
-    app.option(.spam, .{ .summary = "option" });
+    app.option(.spam, .{
+        .summary = "option",
+        // .long = "f@s",
+        .short = '1',
+    });
     app.option(.Foo_Bar_hello, .{ .summary = "option" });
-    app.require_explicit_definitions();
+    // app.require_explicit_definitions();
 
     var result = app.parse(init);
     defer result.deinit();
