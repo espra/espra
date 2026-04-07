@@ -7,7 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
-const initialisms = std.StaticStringMap([]const u8).initComptime(map_initialisms(&.{
+pub const initialisms = std.StaticStringMap([]const u8).initComptime(map_initialisms(&.{
     "AABB",
     "AAC",
     "ABI",
@@ -93,6 +93,7 @@ const initialisms = std.StaticStringMap([]const u8).initComptime(map_initialisms
     "DRM",
     "DSL",
     "DSLs",
+    "DTLS",
     "DTO",
     "DTOs",
     "EAN",
