@@ -76,6 +76,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         RootCommand,
         RootCommand,
         unqualified_type_name(RootCommand),
+        &.{},
         &option_idx,
         &option_meta,
         &subcommand_idx,
@@ -645,10 +646,10 @@ pub const WrapSpec = struct {
 };
 
 fn OptionMeta(comptime RootCommand: type) type {
-    _ = RootCommand;
     return struct {
-        // decode_cli: *const fn (*RootCommand, Allocator, []const u8) ?[]const u8,
-        // decode_env: *const fn (*RootCommand, Allocator, []const u8) ?[]const u8,
+        decode_arg: ?*const fn (Allocator, *RootCommand, []const u8) ?[]const u8,
+        decode_args: ?*const fn (Allocator, *RootCommand, []const []const u8) ?[]const u8,
+        decode_env: *const fn (Allocator, *RootCommand, []const u8) ?[]const u8,
         default_text: ?[]const u8 = null,
         dotted_path: []const u8,
         field_path: []const []const u8,
@@ -666,34 +667,163 @@ const SubcommandMeta = struct {
 const ValueKind = union(enum) {
     const Self = @This();
     bool,
-    custom,
-    enum_string,
+    interface,
     float,
     int,
-    list: *const Self,
     optional: *const Self,
     pointer: *const Self,
+    slice: *const Self,
     string,
+    string_enum,
 
-    fn from_type(comptime path: []const u8, comptime name: []const u8, comptime T: type) Self {
+    fn from_type(comptime T: type, comptime dotted_path: []const u8, comptime nested_slice: bool, comptime nested_optional: bool) Self {
         return switch (@typeInfo(T)) {
-            .bool => .bool,
+            .bool => {
+                if (nested_slice) {
+                    @compileError("Unsupported type for cli.App field found in " ++ dotted_path ++ ": bool slice");
+                }
+                return .bool;
+            },
+            .@"enum" => {
+                if (match_cli_interface(T, dotted_path)) {
+                    return .interface;
+                }
+                return .string_enum;
+            },
             .float => .float,
             .int => .int,
+            .optional => |info| {
+                if (nested_optional) {
+                    @compileError("Unsupported type for cli.App field found in " ++ dotted_path ++ ": " ++ @typeName(T) ++ ": nested optionals");
+                }
+                return .{ .optional = from_type(info.child, dotted_path, nested_slice, true) };
+            },
             .pointer => |info| {
                 if (info.size == .slice and info.child == u8) {
                     return .string;
                 }
                 if (info.size == .slice) {
-                    return .list{.from_type(info.child)};
+                    if (nested_slice) {
+                        @compileError("Unsupported type for cli.App field found in " ++ dotted_path ++ ": " ++ @typeName(T) ++ ": nested slices");
+                    }
+                    if (nested_optional) {
+                        @compileError("Unsupported type for cli.App field found in " ++ dotted_path ++ ": " ++ @typeName(T) ++ ": optional non-string slices");
+                    }
+                    return .{ .slice = from_type(info.child, dotted_path, true, nested_optional) };
                 }
-                return .{ .pointer = from_type(info.child) };
+                @compileError("Unsupported type for cli.App field found in " ++ dotted_path ++ ": " ++ @typeName(T) ++ ": non-slice pointer");
             },
-            .optional => |info| .{ .optional = from_type(info.child) },
-            .@"enum" => .enum_string,
-            .@"struct" => .custom,
-            else => @compileError("Unsupported type for cli.App field found in " ++ path ++ "." ++ name ++ ": " ++ @typeName(T)),
+            .@"struct" => |info| {
+                if (info.layout != .auto) {
+                    @compileError("Unsupported struct layout for cli.App field found in " ++ dotted_path ++ ": " ++ @typeName(T) ++ ": " ++ @tagName(info.layout));
+                }
+                if (info.is_tuple) {
+                    @compileError("Unsupported struct type for cli.App field found in " ++ dotted_path ++ ": " ++ @typeName(T) ++ ": tuple");
+                }
+                if (!match_cli_interface(T, dotted_path)) {
+                    @compileError("Struct type " ++ @typeName(T) ++ " for cli.App field found in " ++ dotted_path ++ " does not have a decode_cli_arg function");
+                }
+                return .interface;
+            },
+            else => @compileError("Unsupported type for cli.App field found in " ++ dotted_path ++ ": " ++ @typeName(T)),
         };
+    }
+
+    fn match_cli_interface(comptime T: type, comptime dotted_path: []const u8) bool {
+        if (@hasDecl(T, "format")) {
+            validate_format(T, dotted_path);
+        }
+        if (@hasDecl(T, "decode_cli_arg")) {
+            validate_decode_cli_arg(T, dotted_path);
+            if (@hasDecl(T, "decode_cli_env")) {
+                validate_decode_cli_env(T, dotted_path);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn validate_decode_cli_arg(comptime T: type, comptime dotted_path: []const u8) void {
+        const err = "Invalid cli interface definition for " ++ @typeName(T) ++ " found in " ++ dotted_path ++ ": .decode_cli_arg ";
+        const decl = @typeInfo(@TypeOf(T.decode_cli_arg));
+        if (decl != .@"fn") {
+            @compileError(err ++ "needs to be a method, not " ++ @tagName(decl));
+        }
+        const func = decl.@"fn";
+        if (func.params.len != 2) {
+            @compileError(err ++ "needs to take exactly 2 parameters: (allocator: mem.Allocator, raw: []const u8), not " ++ std.fmt.comptimePrint("{d}", .{func.params.len}));
+        }
+        if (func.params[0].type) |t| {
+            if (t != Allocator) {
+                @compileError(err ++ "first parameter must be mem.Allocator, not " ++ @typeName(t));
+            }
+        }
+        if (func.params[1].type) |t| {
+            if (t != []const u8) {
+                @compileError(err ++ "second parameter must be []const u8, not " ++ @typeName(t));
+            }
+        }
+        const Return = func.return_type orelse @compileError(err ++ "must have a concrete return type");
+        if (Return != DecodeResult(T)) {
+            @compileError(err ++ "must return cli.DecodeResult(" ++ @typeName(T) ++ "), not " ++ @typeName(Return));
+        }
+    }
+
+    fn validate_decode_cli_env(comptime T: type, comptime dotted_path: []const u8) void {
+        const err = "Invalid cli interface definition for " ++ @typeName(T) ++ " found in " ++ dotted_path ++ ": .decode_cli_env ";
+        const decl = @typeInfo(@TypeOf(T.decode_cli_env));
+        if (decl != .@"fn") {
+            @compileError(err ++ "needs to be a method, not " ++ @tagName(decl));
+        }
+        const func = decl.@"fn";
+        if (func.params.len != 2) {
+            @compileError(err ++ "needs to take exactly 2 parameters: (allocator: mem.Allocator, raw: []const u8), not " ++ std.fmt.comptimePrint("{d}", .{func.params.len}));
+        }
+        if (func.params[0].type) |t| {
+            if (t != Allocator) {
+                @compileError(err ++ "first parameter must be mem.Allocator, not " ++ @typeName(t));
+            }
+        }
+        if (func.params[1].type) |t| {
+            if (t != []const u8) {
+                @compileError(err ++ "second parameter must be []const u8, not " ++ @typeName(t));
+            }
+        }
+        const Return = func.return_type orelse @compileError(err ++ "must have a concrete return type");
+        if (Return != DecodeResult(T)) {
+            @compileError(err ++ "must return cli.DecodeResult(" ++ @typeName(T) ++ "), not " ++ @typeName(Return));
+        }
+    }
+
+    fn validate_format(comptime T: type, comptime dotted_path: []const u8) void {
+        const err = "Invalid cli interface definition for " ++ @typeName(T) ++ " found in " ++ dotted_path ++ ": .format ";
+        const decl = @typeInfo(@TypeOf(T.format));
+        if (decl != .@"fn") {
+            @compileError(err ++ "needs to be a method, not " ++ @tagName(decl));
+        }
+        const func = decl.@"fn";
+        if (func.params.len != 2) {
+            @compileError(err ++ "needs to take exactly 2 parameters: (self: " ++ @typeName(T) ++ ", writer: *Io.Writer), not " ++ std.fmt.comptimePrint("{d}", .{func.params.len}));
+        }
+        if (func.params[0].type) |t| {
+            if (t != T) {
+                @compileError(err ++ "first parameter must be " ++ @typeName(T) ++ ", not " ++ @typeName(t));
+            }
+        }
+        if (func.params[1].type) |t| {
+            if (t != *std.Io.Writer) {
+                @compileError(err ++ "second parameter must be *Io.Writer, not " ++ @typeName(t));
+            }
+        }
+        const Return = func.return_type orelse @compileError(err ++ "must have a concrete return type");
+        switch (@typeInfo(Return)) {
+            .error_union => |info| {
+                if (info.payload != void) {
+                    @compileError(err ++ "must return !void, not " ++ @typeName(Return));
+                }
+            },
+            else => @compileError(err ++ "must return !void, not " ++ @typeName(Return)),
+        }
     }
 };
 
@@ -766,7 +896,7 @@ fn construct_option_enum(comptime T: type, comptime prefix: []const u8, field_na
     }
 }
 
-fn construct_meta(comptime RootCommand: type, comptime T: type, comptime prefix: []const u8, option_idx: *usize, option_meta: []OptionMeta(RootCommand), subcommand_idx: *usize, subcommand_meta: []SubcommandMeta) void {
+fn construct_meta(comptime RootCommand: type, comptime T: type, comptime prefix: []const u8, comptime path: []const []const u8, option_idx: *usize, option_meta: []OptionMeta(RootCommand), subcommand_idx: *usize, subcommand_meta: []SubcommandMeta) void {
     inline for (std.meta.fields(T)) |field| {
         if (std.ascii.isUpper(field.name[0])) {
             const name = prefix ++ "." ++ field.name;
@@ -775,14 +905,14 @@ fn construct_meta(comptime RootCommand: type, comptime T: type, comptime prefix:
                 .name = pascal_to_kebab(field.name),
             };
             subcommand_idx.* += 1;
-            construct_meta(RootCommand, field.type, name, option_idx, option_meta, subcommand_idx, subcommand_meta);
+            construct_meta(RootCommand, field.type, name, path ++ &[_][]const u8{field.name}, option_idx, option_meta, subcommand_idx, subcommand_meta);
         } else {
             const name = prefix ++ "." ++ field.name;
             option_meta[option_idx.*] = .{
                 .dotted_path = name,
-                .field_path = &[_][]const u8{field.name},
+                .field_path = path ++ &[_][]const u8{field.name},
                 .has_default = field.default_value_ptr != null,
-                .kind = ValueKind.from_type(prefix, field.name, field.type),
+                .kind = ValueKind.from_type(field.type, prefix ++ "." ++ field.name, false, false),
                 .long = snake_to_kebab(field.name),
             };
             option_idx.* += 1;
@@ -977,12 +1107,27 @@ test "snake_to_kebab" {
     try test_snake_conversion("http11_server", "http11-server");
 }
 
+const Duration = struct {
+    value: i64,
+
+    pub fn decode_cli_arg(allocator: Allocator, raw: []const u8) DecodeResult(Duration) {
+        _ = allocator;
+        _ = raw;
+        return .{ .ok = Duration{ .value = 1 } };
+    }
+
+    pub fn format(self: Duration, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        _ = self;
+        try writer.writeAll("1h1m1s");
+    }
+};
+
 const MyApp = struct {
     Foo: struct {
         Bar: struct {
             hello: bool,
         },
-        baz: bool,
+        baz: Duration,
     },
     spam: bool,
 };
