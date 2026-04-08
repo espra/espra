@@ -68,29 +68,38 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         usage: ?Usage,
     };
 
+    comptime var option_idx: usize = 0;
+    comptime var option_meta: [options_count]OptionMeta(RootCommand) = undefined;
+    comptime var subcommand_idx: usize = 0;
+    comptime var subcommand_meta: [subcommands_count]SubcommandMeta = undefined;
+    comptime construct_meta(
+        RootCommand,
+        RootCommand,
+        unqualified_type_name(RootCommand),
+        &option_idx,
+        &option_meta,
+        &subcommand_idx,
+        &subcommand_meta,
+    );
+
     return struct {
         app_options: AppOptions(RootCommand),
-        option_names: [options_count][]const u8,
+        option_meta: [options_count]OptionMeta(RootCommand),
         options: [options_count]?OptionInfo(RootCommand, OptionGroup),
         require_explicit: bool,
-        subcommand_names: [subcommands_count][]const u8,
+        subcommand_meta: [subcommands_count]SubcommandMeta,
         subcommands: [subcommands_count]?SubcommandInfo(RootCommand, SubcommandGroup),
 
         const Self = @This();
 
         pub fn init(options: AppOptions(RootCommand)) Self {
-            comptime var option_idx: usize = 0;
-            comptime var option_names: [options_count][]const u8 = undefined;
-            comptime var subcommand_idx: usize = 0;
-            comptime var subcommand_names: [subcommands_count][]const u8 = undefined;
-            comptime collect_field_names(RootCommand, unqualified_type_name(RootCommand), &option_idx, &option_names, &subcommand_idx, &subcommand_names);
-
+            _ = ResolvedCommand;
             return .{
                 .app_options = options,
-                .option_names = option_names,
+                .option_meta = option_meta,
                 .options = .{null} ** options_count,
                 .require_explicit = false,
-                .subcommand_names = subcommand_names,
+                .subcommand_meta = subcommand_meta,
                 .subcommands = .{null} ** subcommands_count,
             };
         }
@@ -203,12 +212,12 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         fn check_explicit_definitions(self: *Self) ?MissingDefinitionError {
             for (0..subcommands_count) |i| {
                 if (self.subcommands[i] == null) {
-                    return .{ .subcommand = self.subcommand_names[i] };
+                    return .{ .subcommand = self.subcommand_meta[i].dotted_path };
                 }
             }
             for (0..options_count) |i| {
                 if (self.options[i] == null) {
-                    return .{ .option = self.option_names[i] };
+                    return .{ .option = self.option_meta[i].dotted_path };
                 }
             }
             return null;
@@ -242,14 +251,14 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         }
 
         fn validate_definitions(self: *Self, allocator: Allocator) ?ValidationError {
-            var foo: std.AutoHashMapUnmanaged(u8, void) = .empty;
+            // var foo: std.AutoHashMapUnmanaged(u8, void) = .empty;
             for (self.subcommands, 0..) |s, i| if (s) |info| {
                 if (info.name) |name| {
                     if (name.len == 0) {
                         return .{
                             .subcommand = .{
                                 .message = "`name` is an empty string",
-                                .subcommand_name = self.subcommand_names[i],
+                                .subcommand_name = self.subcommand_meta[i].dotted_path,
                             },
                         };
                     }
@@ -260,7 +269,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                             return .{
                                 .subcommand = .{
                                     .message = "cannot set both `subcommands_only` and `min_args`",
-                                    .subcommand_name = self.subcommand_names[i],
+                                    .subcommand_name = self.subcommand_meta[i].dotted_path,
                                 },
                             };
                         }
@@ -270,7 +279,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                             return .{
                                 .subcommand = .{
                                     .message = "cannot set both `subcommands_only` and `max_args`",
-                                    .subcommand_name = self.subcommand_names[i],
+                                    .subcommand_name = self.subcommand_meta[i].dotted_path,
                                 },
                             };
                         }
@@ -283,7 +292,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                         return .{
                             .option = .{
                                 .message = "`long` is an empty string",
-                                .option_name = self.option_names[i],
+                                .option_name = self.option_meta[i].dotted_path,
                             },
                         };
                     }
@@ -291,7 +300,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                         return .{
                             .option = .{
                                 .message = "`long` is a single character",
-                                .option_name = self.option_names[i],
+                                .option_name = self.option_meta[i].dotted_path,
                             },
                         };
                     }
@@ -299,7 +308,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                         return .{
                             .option = .{
                                 .message = "`long` starts with a hyphen",
-                                .option_name = self.option_names[i],
+                                .option_name = self.option_meta[i].dotted_path,
                             },
                         };
                     }
@@ -307,7 +316,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                         return .{
                             .option = .{
                                 .message = std.fmt.allocPrint(allocator, "`long` contains an invalid character: \"{c}\" (0x{x})", .{ char, char }) catch oom(self.app_options.name),
-                                .option_name = self.option_names[i],
+                                .option_name = self.option_meta[i].dotted_path,
                             },
                         };
                     }
@@ -317,7 +326,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                         return .{
                             .option = .{
                                 .message = std.fmt.allocPrint(allocator, "`short` value is invalid: \"{c}\" (0x{x})", .{ short, short }) catch oom(self.app_options.name),
-                                .option_name = self.option_names[i],
+                                .option_name = self.option_meta[i].dotted_path,
                             },
                         };
                     }
@@ -629,17 +638,101 @@ pub const ValidationError = union(enum) {
     },
 };
 
-fn collect_field_names(comptime T: type, comptime prefix: []const u8, option_idx: *usize, option_names: [][]const u8, subcommand_idx: *usize, subcommand_names: [][]const u8) void {
-    inline for (std.meta.fields(T)) |field| {
-        if (std.ascii.isUpper(field.name[0])) {
-            const name = prefix ++ "." ++ field.name;
-            subcommand_names[subcommand_idx.*] = name;
-            subcommand_idx.* += 1;
-            collect_field_names(field.type, name, option_idx, option_names, subcommand_idx, subcommand_names);
+pub const WrapSpec = struct {
+    indent: u32 = 0,
+    start_col: u32 = 0,
+    width: u32 = 80,
+};
+
+fn OptionMeta(comptime RootCommand: type) type {
+    _ = RootCommand;
+    return struct {
+        // decode_cli: *const fn (*RootCommand, Allocator, []const u8) ?[]const u8,
+        // decode_env: *const fn (*RootCommand, Allocator, []const u8) ?[]const u8,
+        default_text: ?[]const u8 = null,
+        dotted_path: []const u8,
+        field_path: []const []const u8,
+        has_default: bool,
+        kind: ValueKind,
+        long: []const u8,
+    };
+}
+
+const SubcommandMeta = struct {
+    dotted_path: []const u8,
+    name: []const u8,
+};
+
+const ValueKind = union(enum) {
+    const Self = @This();
+    bool,
+    custom,
+    enum_string,
+    float,
+    int,
+    list: *const Self,
+    optional: *const Self,
+    pointer: *const Self,
+    string,
+
+    fn from_type(comptime path: []const u8, comptime name: []const u8, comptime T: type) Self {
+        return switch (@typeInfo(T)) {
+            .bool => .bool,
+            .float => .float,
+            .int => .int,
+            .pointer => |info| {
+                if (info.size == .slice and info.child == u8) {
+                    return .string;
+                }
+                if (info.size == .slice) {
+                    return .list{.from_type(info.child)};
+                }
+                return .{ .pointer = from_type(info.child) };
+            },
+            .optional => |info| .{ .optional = from_type(info.child) },
+            .@"enum" => .enum_string,
+            .@"struct" => .custom,
+            else => @compileError("Unsupported type for cli.App field found in " ++ path ++ "." ++ name ++ ": " ++ @typeName(T)),
+        };
+    }
+};
+
+pub fn write_wrapped(writer: *std.Io.Writer, text: []const u8, spec: WrapSpec) !void {
+    var col = spec.start_col;
+    if (col < spec.indent) {
+        _ = try writer.splatByte(' ', spec.indent - col);
+        col = spec.indent;
+    }
+    var first = true;
+    var i: usize = 0;
+    while (i < text.len) {
+        while (i < text.len and text[i] == ' ') : (i += 1) {}
+        const word_start = i;
+        while (i < text.len and text[i] != ' ' and text[i] != '\n') : (i += 1) {}
+        const word = text[word_start..i];
+        if (word.len == 0) {
+            if (i < text.len and text[i] == '\n') {
+                try writer.writeByte('\n');
+                _ = try writer.splatByte(' ', spec.indent);
+                col = spec.indent;
+                first = true;
+                i += 1;
+            }
+            continue;
+        }
+        if (first) {
+            try writer.writeAll(word);
+            col += @intCast(word.len);
+            first = false;
+        } else if (col + 1 + @as(u32, @intCast(word.len)) > spec.width) {
+            try writer.writeByte('\n');
+            _ = try writer.splatByte(' ', spec.indent);
+            try writer.writeAll(word);
+            col = spec.indent + @as(u32, @intCast(word.len));
         } else {
-            const name = prefix ++ "." ++ field.name;
-            option_names[option_idx.*] = name;
-            option_idx.* += 1;
+            try writer.writeByte(' ');
+            try writer.writeAll(word);
+            col += 1 + @as(u32, @intCast(word.len));
         }
     }
 }
@@ -669,6 +762,30 @@ fn construct_option_enum(comptime T: type, comptime prefix: []const u8, field_na
             field_names[idx.*] = prefix ++ field.name;
             field_values[idx.*] = @as(u64, cmd.*) << 48 | @as(u64, i) << 32 | idx.*;
             idx.* += 1;
+        }
+    }
+}
+
+fn construct_meta(comptime RootCommand: type, comptime T: type, comptime prefix: []const u8, option_idx: *usize, option_meta: []OptionMeta(RootCommand), subcommand_idx: *usize, subcommand_meta: []SubcommandMeta) void {
+    inline for (std.meta.fields(T)) |field| {
+        if (std.ascii.isUpper(field.name[0])) {
+            const name = prefix ++ "." ++ field.name;
+            subcommand_meta[subcommand_idx.*] = .{
+                .dotted_path = name,
+                .name = pascal_to_kebab(field.name),
+            };
+            subcommand_idx.* += 1;
+            construct_meta(RootCommand, field.type, name, option_idx, option_meta, subcommand_idx, subcommand_meta);
+        } else {
+            const name = prefix ++ "." ++ field.name;
+            option_meta[option_idx.*] = .{
+                .dotted_path = name,
+                .field_path = &[_][]const u8{field.name},
+                .has_default = field.default_value_ptr != null,
+                .kind = ValueKind.from_type(prefix, field.name, field.type),
+                .long = snake_to_kebab(field.name),
+            };
+            option_idx.* += 1;
         }
     }
 }
