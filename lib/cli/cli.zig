@@ -106,7 +106,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         }
 
         pub fn option(self: *Self, opt: Option(RootCommand), info: OptionInfo(RootCommand, OptionGroup)) void {
-            self.options[@intFromEnum(opt) & 0xFFFFFFFF] = info;
+            self.options[@intFromEnum(opt)] = info;
         }
 
         pub fn parse(self: *Self, proc: std.process.Init) SuccessResult(RootCommand) {
@@ -187,7 +187,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         }
 
         pub fn subcommand(self: *Self, cmd: Subcommand(RootCommand), info: SubcommandInfo(RootCommand, SubcommandGroup)) void {
-            self.subcommands[(@intFromEnum(cmd) & 0xFFFF) - 1] = info;
+            self.subcommands[@intFromEnum(cmd)] = info;
         }
 
         fn build_help_context(self: *Self, cmd: InvokedCommand(RootCommand)) HelpContext(RootCommand) {
@@ -500,14 +500,12 @@ pub fn HelpContext(comptime RootCommand: type) type {
 pub fn InvokedCommand(comptime RootCommand: type) type {
     const count = find_subcommands(RootCommand, "") + 1;
     comptime var field_names: [count][]const u8 = undefined;
-    comptime var field_values: [count]u32 = undefined;
+    comptime var field_values: [count]u16 = undefined;
     comptime var idx: usize = 1;
-    comptime var cmd: usize = 1;
-    comptime var parent: usize = 0;
     field_names[0] = "Default";
     field_values[0] = 0;
-    construct_command_enum(RootCommand, "", &field_names, &field_values, &idx, &cmd, &parent);
-    return @Enum(u32, .exhaustive, &field_names, &field_values);
+    construct_command_enum(RootCommand, "", &field_names, &field_values, &idx);
+    return @Enum(u16, .exhaustive, &field_names, &field_values);
 }
 
 pub const MissingDefinitionError = union(enum) {
@@ -518,11 +516,10 @@ pub const MissingDefinitionError = union(enum) {
 pub fn Option(comptime RootCommand: type) type {
     const count = find_options(RootCommand, "");
     comptime var field_names: [count][]const u8 = undefined;
-    comptime var field_values: [count]u64 = undefined;
+    comptime var field_values: [count]u32 = undefined;
     comptime var idx: usize = 0;
-    comptime var cmd: u16 = 0;
-    construct_option_enum(RootCommand, "", &field_names, &field_values, &idx, &cmd);
-    return @Enum(u64, .exhaustive, &field_names, &field_values);
+    construct_option_enum(RootCommand, "", &field_names, &field_values, &idx);
+    return @Enum(u32, .exhaustive, &field_names, &field_values);
 }
 
 pub const OptionError = struct {
@@ -581,12 +578,10 @@ pub fn ParseResult(comptime RootCommand: type) type {
 pub fn Subcommand(comptime RootCommand: type) type {
     const count = find_subcommands(RootCommand, "");
     comptime var field_names: [count][]const u8 = undefined;
-    comptime var field_values: [count]u32 = undefined;
+    comptime var field_values: [count]u16 = undefined;
     comptime var idx: usize = 0;
-    comptime var cmd: usize = 1;
-    comptime var parent: usize = 0;
-    construct_command_enum(RootCommand, "", &field_names, &field_values, &idx, &cmd, &parent);
-    return @Enum(u32, .exhaustive, &field_names, &field_values);
+    construct_command_enum(RootCommand, "", &field_names, &field_values, &idx);
+    return @Enum(u16, .exhaustive, &field_names, &field_values);
 }
 
 pub const SubcommandHelpEntry = struct {
@@ -956,30 +951,27 @@ fn construct_meta(comptime RootCommand: type, comptime T: type, comptime prefix:
     }
 }
 
-fn construct_command_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u32, idx: *usize, cmd: *usize, parent: *usize) void {
+fn construct_command_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u16, idx: *usize) void {
     for (std.meta.fields(T)) |field| {
         if (!std.ascii.isUpper(field.name[0])) {
             continue;
         }
         const name = if (prefix.len == 0) field.name else prefix ++ "_" ++ field.name;
         field_names[idx.*] = name;
-        field_values[idx.*] = @as(u32, parent.*) << 16 | @as(u32, cmd.*);
-        parent.* = cmd.*;
-        cmd.* += 1;
+        field_values[idx.*] = idx.*;
         idx.* += 1;
-        construct_command_enum(field.type, name, field_names, field_values, idx, cmd, parent);
+        construct_command_enum(field.type, name, field_names, field_values, idx);
     }
 }
 
-fn construct_option_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u64, idx: *usize, cmd: *u16) void {
-    for (std.meta.fields(T), 0..) |field, i| {
+fn construct_option_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u32, idx: *usize) void {
+    for (std.meta.fields(T)) |field| {
         if (std.ascii.isUpper(field.name[0])) {
             const name = if (prefix.len == 0) field.name ++ "_" else prefix ++ field.name ++ "_";
-            cmd.* += 1;
-            construct_option_enum(field.type, name, field_names, field_values, idx, cmd);
+            construct_option_enum(field.type, name, field_names, field_values, idx);
         } else {
             field_names[idx.*] = prefix ++ field.name;
-            field_values[idx.*] = @as(u64, cmd.*) << 48 | @as(u64, i) << 32 | idx.*;
+            field_values[idx.*] = idx.*;
             idx.* += 1;
         }
     }
