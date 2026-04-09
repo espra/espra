@@ -416,6 +416,37 @@ pub const CommandHelpEntry = struct {
     usage: ?[]const u8 = null,
 };
 
+pub fn Completer(comptime RootCommand: type) type {
+    return *const fn (
+        allocator: Allocator,
+        root: *const RootCommand,
+        invoked_command: InvokedCommand(RootCommand),
+        args: []const u8,
+    ) anyerror![]const Completion;
+}
+
+pub const Completion = struct {
+    description: ?[]const u8 = null,
+    value: []const u8,
+};
+
+const DecodeError = struct {
+    err: ?[]const u8,
+};
+
+pub fn DecodeResult(comptime T: type) type {
+    return union(enum) {
+        err: []const u8,
+        ok: T,
+    };
+}
+
+const DecodeSource = union(enum) {
+    arg: []const u8,
+    args: []const []const u8,
+    env: []const u8,
+};
+
 pub const DeprecatedOption = struct {
     command_path: []const u8,
     message: []const u8,
@@ -431,27 +462,6 @@ pub const Deprecation = union(enum) {
     option: DeprecatedOption,
     subcommand: DeprecatedSubcommand,
 };
-
-pub fn Completer(comptime RootCommand: type) type {
-    return *const fn (
-        allocator: Allocator,
-        root: *const RootCommand,
-        invoked_command: InvokedCommand(RootCommand),
-        args: []const u8,
-    ) anyerror![]const Completion;
-}
-
-pub const Completion = struct {
-    description: ?[]const u8 = null,
-    value: []const u8,
-};
-
-pub fn DecodeResult(comptime T: type) type {
-    return union(enum) {
-        err: []const u8,
-        ok: T,
-    };
-}
 
 pub const ErrorResult = union(enum) {
     command: CommandError,
@@ -647,10 +657,8 @@ pub const WrapSpec = struct {
 
 fn OptionMeta(comptime RootCommand: type) type {
     return struct {
-        decode_arg: ?*const fn (Allocator, *RootCommand, []const u8) ?[]const u8,
-        decode_args: ?*const fn (Allocator, *RootCommand, []const []const u8) ?[]const u8,
-        decode_env: *const fn (Allocator, *RootCommand, []const u8) ?[]const u8,
-        default_text: ?[]const u8 = null,
+        decode: *const fn (Allocator, *RootCommand, DecodeSource) DecodeError,
+        default_text: ?[]const u8,
         dotted_path: []const u8,
         field_path: []const []const u8,
         has_default: bool,
@@ -661,6 +669,7 @@ fn OptionMeta(comptime RootCommand: type) type {
 
 const SubcommandMeta = struct {
     dotted_path: []const u8,
+    field_path: []const []const u8,
     name: []const u8,
 };
 
@@ -671,7 +680,6 @@ const ValueKind = union(enum) {
     float,
     int,
     optional: *const Self,
-    pointer: *const Self,
     slice: *const Self,
     string,
     string_enum,
@@ -690,13 +698,16 @@ const ValueKind = union(enum) {
                 }
                 return .string_enum;
             },
-            .float => .float,
-            .int => .int,
+            .float, .comptime_float => .float,
+            .int, .comptime_int => .int,
             .optional => |info| {
                 if (nested_optional) {
                     @compileError("Unsupported type for cli.App field found in " ++ dotted_path ++ ": " ++ @typeName(T) ++ ": nested optionals");
                 }
-                return .{ .optional = from_type(info.child, dotted_path, nested_slice, true) };
+                if (nested_slice) {
+                    @compileError("Unsupported type for cli.App field found in " ++ dotted_path ++ ": " ++ @typeName(T) ++ ": nested optional within a slice");
+                }
+                return .{ .optional = &from_type(info.child, dotted_path, nested_slice, true) };
             },
             .pointer => |info| {
                 if (info.size == .slice and info.child == u8) {
@@ -709,7 +720,7 @@ const ValueKind = union(enum) {
                     if (nested_optional) {
                         @compileError("Unsupported type for cli.App field found in " ++ dotted_path ++ ": " ++ @typeName(T) ++ ": optional non-string slices");
                     }
-                    return .{ .slice = from_type(info.child, dotted_path, true, nested_optional) };
+                    return .{ .slice = &from_type(info.child, dotted_path, true, nested_optional) };
                 }
                 @compileError("Unsupported type for cli.App field found in " ++ dotted_path ++ ": " ++ @typeName(T) ++ ": non-slice pointer");
             },
@@ -867,6 +878,84 @@ pub fn write_wrapped(writer: *std.Io.Writer, text: []const u8, spec: WrapSpec) !
     }
 }
 
+fn construct_decode(comptime RootCommand: type, comptime T: type, comptime kind: ValueKind, comptime path: []const []const u8) *const fn (Allocator, *RootCommand, DecodeSource) DecodeError {
+    return struct {
+        fn decode(allocator: Allocator, root: *RootCommand, source: DecodeSource) DecodeError {
+            const ptr = get_root_field_ptr(RootCommand, T, root, path);
+            switch (source) {
+                .arg => |val| return decode_cli_arg(T, kind, allocator, ptr, val),
+                .args => |vals| {
+                    switch (kind) {
+                        .slice => |inner| {
+                            const Inner = std.meta.Child(T);
+                            var list: std.ArrayList(Inner) = .empty;
+                            for (vals) |val| {
+                                const elem = blk: switch (inner.*) {
+                                    .bool => unreachable,
+                                    .float => {
+                                        break :blk std.fmt.parseFloat(Inner, val) catch return .{ .err = "invalid float value" };
+                                    },
+                                    .int => {
+                                        break :blk std.fmt.parseInt(Inner, val, 10) catch return .{ .err = "invalid int value" };
+                                    },
+                                    .interface => {
+                                        const result = Inner.decode_cli_arg(allocator, val);
+                                        switch (result) {
+                                            .ok => |elem| break :blk elem,
+                                            .err => |e| return .{ .err = e },
+                                        }
+                                    },
+                                    .optional => unreachable,
+                                    .slice => unreachable,
+                                    .string => break :blk val,
+                                    .string_enum => break :blk std.meta.stringToEnum(Inner, val) catch return .{ .err = "invalid enum variant" },
+                                };
+                                list.append(allocator, elem) catch return .{ .err = "out of memory" };
+                            }
+                            ptr.* = list.items;
+                            return .{ .err = null };
+                        },
+                        else => unreachable,
+                    }
+                },
+                .env => |val| return decode_cli_env(T, kind, allocator, ptr, val),
+            }
+            return .{ .err = null };
+        }
+    }.decode;
+}
+
+fn construct_meta(comptime RootCommand: type, comptime T: type, comptime prefix: []const u8, comptime path: []const []const u8, option_idx: *usize, option_meta: []OptionMeta(RootCommand), subcommand_idx: *usize, subcommand_meta: []SubcommandMeta) void {
+    inline for (std.meta.fields(T)) |field| {
+        if (std.ascii.isUpper(field.name[0])) {
+            const name = prefix ++ "." ++ field.name;
+            subcommand_meta[subcommand_idx.*] = .{
+                .dotted_path = name,
+                .field_path = path ++ &[_][]const u8{field.name},
+                .name = pascal_to_kebab(field.name),
+            };
+            subcommand_idx.* += 1;
+            construct_meta(RootCommand, field.type, name, path ++ &[_][]const u8{field.name}, option_idx, option_meta, subcommand_idx, subcommand_meta);
+        } else {
+            const field_path = path ++ &[_][]const u8{field.name};
+            const name = prefix ++ "." ++ field.name;
+            const kind = ValueKind.from_type(field.type, name, false, false);
+            const has_default = field.default_value_ptr != null;
+            const default_text = if (has_default) get_default_text(kind, field) else null;
+            option_meta[option_idx.*] = .{
+                .decode = construct_decode(RootCommand, field.type, kind, field_path),
+                .default_text = default_text,
+                .dotted_path = name,
+                .field_path = field_path,
+                .has_default = has_default,
+                .kind = kind,
+                .long = snake_to_kebab(field.name),
+            };
+            option_idx.* += 1;
+        }
+    }
+}
+
 fn construct_command_enum(comptime T: type, comptime prefix: []const u8, field_names: [][]const u8, field_values: []u32, idx: *usize, cmd: *usize, parent: *usize) void {
     for (std.meta.fields(T)) |field| {
         if (!std.ascii.isUpper(field.name[0])) {
@@ -896,28 +985,75 @@ fn construct_option_enum(comptime T: type, comptime prefix: []const u8, field_na
     }
 }
 
-fn construct_meta(comptime RootCommand: type, comptime T: type, comptime prefix: []const u8, comptime path: []const []const u8, option_idx: *usize, option_meta: []OptionMeta(RootCommand), subcommand_idx: *usize, subcommand_meta: []SubcommandMeta) void {
-    inline for (std.meta.fields(T)) |field| {
-        if (std.ascii.isUpper(field.name[0])) {
-            const name = prefix ++ "." ++ field.name;
-            subcommand_meta[subcommand_idx.*] = .{
-                .dotted_path = name,
-                .name = pascal_to_kebab(field.name),
-            };
-            subcommand_idx.* += 1;
-            construct_meta(RootCommand, field.type, name, path ++ &[_][]const u8{field.name}, option_idx, option_meta, subcommand_idx, subcommand_meta);
-        } else {
-            const name = prefix ++ "." ++ field.name;
-            option_meta[option_idx.*] = .{
-                .dotted_path = name,
-                .field_path = path ++ &[_][]const u8{field.name},
-                .has_default = field.default_value_ptr != null,
-                .kind = ValueKind.from_type(field.type, prefix ++ "." ++ field.name, false, false),
-                .long = snake_to_kebab(field.name),
-            };
-            option_idx.* += 1;
-        }
+fn decode_bool(allocator: Allocator, value: []const u8) DecodeResult(bool) {
+    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "yes") or std.mem.eql(u8, value, "on")) {
+        return .{ .ok = true };
     }
+    if (std.mem.eql(u8, value, "") or std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "no") or std.mem.eql(u8, value, "off")) {
+        return .{ .ok = false };
+    }
+    const err = std.fmt.allocPrint(allocator, "invalid bool value: {s}", .{value}) catch "invalid bool value";
+    return .{ .err = err };
+}
+
+fn decode_cli_arg(comptime T: type, comptime kind: ValueKind, allocator: Allocator, ptr: *T, val: []const u8) DecodeError {
+    switch (kind) {
+        .bool => ptr.* = true,
+        .float => ptr.* = std.fmt.parseFloat(T, val) catch return .{ .err = "invalid float value" },
+        .int => ptr.* = std.fmt.parseInt(T, val, 10) catch return .{ .err = "invalid int value" },
+        .interface => {
+            const result = T.decode_cli_arg(allocator, val);
+            switch (result) {
+                .ok => |v| ptr.* = v,
+                .err => |e| return .{ .err = e },
+            }
+        },
+        .optional => |inner| {
+            const Inner = std.meta.Child(T);
+            return decode_cli_arg(Inner, allocator, inner.*, ptr, val);
+        },
+        .slice => unreachable,
+        .string => ptr.* = val,
+        .string_enum => ptr.* = std.meta.stringToEnum(T, val) catch return .{ .err = "invalid enum variant" },
+    }
+    return .{ .err = null };
+}
+
+fn decode_cli_env(comptime T: type, comptime kind: ValueKind, allocator: Allocator, ptr: *T, val: []const u8) DecodeError {
+    switch (kind) {
+        .bool => {
+            const result = decode_bool(allocator, val);
+            switch (result) {
+                .ok => |v| ptr.* = v,
+                .err => |e| return .{ .err = e },
+            }
+        },
+        .float => ptr.* = std.fmt.parseFloat(T, val) catch return .{ .err = "invalid float value" },
+        .int => ptr.* = std.fmt.parseInt(T, val, 10) catch return .{ .err = "invalid int value" },
+        .interface => {
+            if (@hasDecl(T, "decode_cli_env")) {
+                const result = T.decode_cli_env(allocator, val);
+                switch (result) {
+                    .ok => |v| ptr.* = v,
+                    .err => |e| return .{ .err = e },
+                }
+            } else {
+                const result = T.decode_cli_arg(allocator, val);
+                switch (result) {
+                    .ok => |v| ptr.* = v,
+                    .err => |e| return .{ .err = e },
+                }
+            }
+        },
+        .optional => |inner| {
+            const Inner = std.meta.Child(T);
+            return decode_cli_arg(Inner, allocator, inner.*, ptr, val);
+        },
+        .slice => unreachable,
+        .string => ptr.* = val,
+        .string_enum => ptr.* = std.meta.stringToEnum(T, val) catch return .{ .err = "invalid enum variant" },
+    }
+    return .{ .err = null };
 }
 
 fn exit_error(app_name: []const u8, message: []const u8) noreturn {
@@ -971,6 +1107,57 @@ fn find_subcommands(comptime T: type, comptime prefix: []const u8) usize {
         count += find_subcommands(field.type, prefix ++ "." ++ field.name);
     }
     return count;
+}
+
+fn get_default_text(comptime kind: ValueKind, comptime field: std.builtin.Type.StructField) ?[]const u8 {
+    // NOTE(tav): We bail on .interface, non-null .optional, and .slices involving non-primitive types.
+    return switch (kind) {
+        .bool => if (field.defaultValue().?) "true" else "false",
+        .float => std.fmt.comptimePrint("{}", .{field.defaultValue().?}),
+        .int => std.fmt.comptimePrint("{d}", .{field.defaultValue().?}),
+        .interface => null,
+        .optional => if (field.defaultValue().? == null) "null" else null,
+        .slice => |elem_kind| {
+            return comptime blk: {
+                var out: []const u8 = "[";
+                for (field.defaultValue().?, 0..) |elem, i| {
+                    if (i > 0) {
+                        out = out ++ ", ";
+                    }
+                    out = out ++ switch (elem_kind.*) {
+                        .float => std.fmt.comptimePrint("{}", .{elem}),
+                        .int => std.fmt.comptimePrint("{d}", .{elem}),
+                        .string => std.fmt.comptimePrint("{s}", .{elem}),
+                        .string_enum => @tagName(elem),
+                        else => {
+                            return null;
+                        },
+                    };
+                }
+                break :blk out ++ "]";
+            };
+        },
+        .string => std.fmt.comptimePrint("{s}", .{field.defaultValue().?}),
+        .string_enum => @tagName(field.defaultValue().?),
+    };
+}
+
+fn get_root_field_ptr(comptime RootCommand: type, comptime T: type, root: *RootCommand, comptime path: []const []const u8) *T {
+    var ptr: *anyopaque = root;
+    inline for (path, 0..) |elem, i| {
+        const Field = comptime get_root_field_type(RootCommand, path[0..i]);
+        const parent: *Field = @ptrCast(@alignCast(ptr));
+        ptr = @ptrCast(&@field(parent, elem));
+    }
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn get_root_field_type(comptime T: type, comptime path: []const []const u8) type {
+    var typ = T;
+    inline for (path) |elem| {
+        typ = @TypeOf(@field(@as(typ, undefined), elem));
+    }
+    return typ;
 }
 
 fn is_invalid_long_flag(long: []const u8) ?u8 {
@@ -1124,8 +1311,9 @@ const Duration = struct {
 
 const MyApp = struct {
     Foo: struct {
+        meow: []const i64 = &.{ 1, 2, 3 },
         Bar: struct {
-            hello: bool,
+            hello: bool = false,
         },
         baz: Duration,
     },
