@@ -32,7 +32,7 @@ pub fn AppOptions(comptime RootCommand: type) type {
         preserve_unmatched_short_options: bool = false,
         prolog: ?[]const u8 = null,
         show_defaults: ?bool = null,
-        subcommands_only: bool = false,
+        supports_positional_args: ?bool = null,
         summary: ?[]const u8 = null,
         usage: ?Usage = null,
         version: ?[]const u8 = null,
@@ -49,23 +49,54 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
     const subcommands_count = find_subcommands(RootCommand, "");
     const options_count = find_options(RootCommand, "");
 
+    const ResolvedOption = struct {
+        complete: ?Completer(RootCommand) = null,
+        decode: *const fn (Allocator, *RootCommand, DecodeSource) DecodeError,
+        default_text: ?[]const u8 = null,
+        depends_on: []const usize = &.{},
+        deprecated: ?[]const u8 = null,
+        dotted_path: []const u8,
+        env_var: ?[]const u8 = null,
+        group: ?OptionGroup = null,
+        has_default: bool,
+        hidden: bool = false,
+        inherited: bool = false,
+        kind: ValueKind,
+        long: []const u8,
+        mutually_exclusive_with: []const usize = &.{},
+        required: bool = false,
+        show_default: ?bool = null,
+        summary: ?[]const u8 = null,
+        value_label: ?[]const u8 = null,
+    };
+
     const ResolvedCommand = struct {
-        aliases: []const Subcommand(RootCommand),
-        complete: ?Completer(RootCommand),
-        deprecated: ?[]const u8,
-        description: ?[]const u8,
-        epilog: ?[]const u8,
-        group: ?SubcommandGroup,
-        hidden: bool,
-        max_args: ?usize,
-        min_args: ?usize,
-        name: ?[]const u8,
-        preserve_unmatched_short_options: bool,
-        prolog: ?[]const u8,
-        struct_path: []const u8,
-        subcommands_only: bool,
-        summary: ?[]const u8,
-        usage: ?Usage,
+        const Self = @This();
+        complete: ?Completer(RootCommand) = null,
+        deprecated: ?[]const u8 = null,
+        description: ?[]const u8 = null,
+        epilog: ?[]const u8 = null,
+        group: ?SubcommandGroup = null,
+        hidden: bool = false,
+        is_alias: bool = false,
+        is_root: bool = false,
+        long_flags: std.AutoHashMapUnmanaged([]const u8, usize),
+        max_args: ?usize = null,
+        min_args: ?usize = null,
+        name: []const u8,
+        preserve_unmatched_short_options: bool = false,
+        prolog: ?[]const u8 = null,
+        short_flags: std.AutoHashMapUnmanaged(u8, usize),
+        subcommands: std.StringHashMapUnmanaged(*Self),
+        summary: ?[]const u8 = null,
+        supports_positional_args: ?bool = null,
+        usage: ?Usage = null,
+    };
+
+    const Resolved = struct {
+        options: [options_count]*ResolvedOption,
+        root: *ResolvedCommand,
+        subcommands: [subcommands_count]*ResolvedCommand,
     };
 
     comptime var option_idx: usize = 0;
@@ -94,7 +125,6 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         const Self = @This();
 
         pub fn init(options: AppOptions(RootCommand)) Self {
-            _ = ResolvedCommand;
             return .{
                 .app_options = options,
                 .option_meta = option_meta,
@@ -148,6 +178,8 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                     };
                 }
             }
+            const resolved = self.resolve_definitions(allocator);
+            _ = resolved;
             if (self.validate_definitions(allocator)) |err| {
                 return .{
                     .err = .{ .validation = err },
@@ -246,6 +278,16 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             default_print_error(allocator, w, app_name, err) catch {};
         }
 
+        fn resolve_definitions(self: *Self, allocator: Allocator) Resolved {
+            _ = allocator;
+            _ = self;
+            return .{
+                .options = .{undefined} ** options_count,
+                .root = undefined,
+                .subcommands = .{undefined} ** subcommands_count,
+            };
+        }
+
         fn run_completion(self: *Self, shell: []const u8) void {
             _ = self;
             _ = shell;
@@ -264,12 +306,12 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                         };
                     }
                 }
-                if (info.subcommands_only) {
+                if (info.supports_positional_args == false) {
                     if (info.min_args) |min_args| {
                         if (min_args > 0) {
                             return .{
                                 .subcommand = .{
-                                    .message = "cannot set both `subcommands_only` and `min_args`",
+                                    .message = "cannot set `min_args` while `supports_positional_args` is false",
                                     .subcommand_name = self.subcommand_meta[i].dotted_path,
                                 },
                             };
@@ -279,7 +321,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                         if (max_args > 0) {
                             return .{
                                 .subcommand = .{
-                                    .message = "cannot set both `subcommands_only` and `max_args`",
+                                    .message = "cannot set `max_args` while `supports_positional_args` is false",
                                     .subcommand_name = self.subcommand_meta[i].dotted_path,
                                 },
                             };
@@ -316,7 +358,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                     if (is_invalid_long_flag(long)) |char| {
                         return .{
                             .option = .{
-                                .message = std.fmt.allocPrint(allocator, "`long` contains an invalid character: \"{c}\" (0x{x})", .{ char, char }) catch oom(self.app_options.name),
+                                .message = std.fmt.allocPrint(allocator, "`long` contains an invalid character: \"{c}\" (0x{x:0>2})", .{ char, char }) catch oom(self.app_options.name),
                                 .option_name = self.option_meta[i].dotted_path,
                             },
                         };
@@ -326,7 +368,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                     if (is_invalid_short_flag(short)) {
                         return .{
                             .option = .{
-                                .message = std.fmt.allocPrint(allocator, "`short` value is invalid: \"{c}\" (0x{x})", .{ short, short }) catch oom(self.app_options.name),
+                                .message = std.fmt.allocPrint(allocator, "`short` value is invalid: \"{c}\" (0x{x:0>2})", .{ short, short }) catch oom(self.app_options.name),
                                 .option_name = self.option_meta[i].dotted_path,
                             },
                         };
@@ -593,7 +635,7 @@ pub const SubcommandHelpEntry = struct {
 
 pub fn SubcommandInfo(comptime RootCommand: type, comptime SubcommandGroup: type) type {
     return struct {
-        aliases: []const Subcommand(RootCommand) = &.{},
+        aliases: []const []const u8 = &.{},
         complete: ?Completer(RootCommand) = null,
         deprecated: ?[]const u8 = null,
         description: ?[]const u8 = null,
@@ -605,8 +647,8 @@ pub fn SubcommandInfo(comptime RootCommand: type, comptime SubcommandGroup: type
         name: ?[]const u8 = null,
         preserve_unmatched_short_options: bool = false,
         prolog: ?[]const u8 = null,
-        subcommands_only: bool = false,
         summary: ?[]const u8 = null,
+        supports_positional_args: ?bool = null,
         usage: ?Usage = null,
     };
 }
@@ -903,7 +945,7 @@ fn construct_decode(comptime RootCommand: type, comptime T: type, comptime kind:
                                     .optional => unreachable,
                                     .slice => unreachable,
                                     .string => break :blk val,
-                                    .string_enum => break :blk std.meta.stringToEnum(Inner, val) catch return .{ .err = "invalid enum variant" },
+                                    .string_enum => break :blk std.meta.stringToEnum(Inner, val) orelse return .{ .err = "invalid enum variant" },
                                 };
                                 list.append(allocator, elem) catch return .{ .err = "out of memory" };
                             }
@@ -1002,11 +1044,11 @@ fn decode_cli_arg(comptime T: type, comptime kind: ValueKind, allocator: Allocat
         },
         .optional => |inner| {
             const Inner = std.meta.Child(T);
-            return decode_cli_arg(Inner, allocator, inner.*, ptr, val);
+            return decode_cli_arg(Inner, inner.*, allocator, ptr, val);
         },
         .slice => unreachable,
         .string => ptr.* = val,
-        .string_enum => ptr.* = std.meta.stringToEnum(T, val) catch return .{ .err = "invalid enum variant" },
+        .string_enum => ptr.* = std.meta.stringToEnum(T, val) orelse return .{ .err = "invalid enum variant" },
     }
     return .{ .err = null };
 }
@@ -1039,11 +1081,11 @@ fn decode_cli_env(comptime T: type, comptime kind: ValueKind, allocator: Allocat
         },
         .optional => |inner| {
             const Inner = std.meta.Child(T);
-            return decode_cli_arg(Inner, allocator, inner.*, ptr, val);
+            return decode_cli_env(Inner, inner.*, allocator, ptr, val);
         },
         .slice => unreachable,
         .string => ptr.* = val,
-        .string_enum => ptr.* = std.meta.stringToEnum(T, val) catch return .{ .err = "invalid enum variant" },
+        .string_enum => ptr.* = std.meta.stringToEnum(T, val) orelse return .{ .err = "invalid enum variant" },
     }
     return .{ .err = null };
 }
@@ -1102,13 +1144,21 @@ fn find_subcommands(comptime T: type, comptime prefix: []const u8) usize {
 }
 
 fn get_default_text(comptime kind: ValueKind, comptime field: std.builtin.Type.StructField) ?[]const u8 {
-    // NOTE(tav): We bail on .interface, non-null .optional, and .slices involving non-primitive types.
+    // NOTE(tav): We bail on any .interface kinds.
     return switch (kind) {
         .bool => if (field.defaultValue().?) "true" else "false",
         .float => std.fmt.comptimePrint("{}", .{field.defaultValue().?}),
         .int => std.fmt.comptimePrint("{d}", .{field.defaultValue().?}),
         .interface => null,
-        .optional => if (field.defaultValue().? == null) "null" else null,
+        .optional => |inner| if (field.defaultValue().? == null) "null" else switch (inner.*) {
+            .bool => if (field.defaultValue().?.? == true) "true" else "false",
+            .float => std.fmt.comptimePrint("{}", .{field.defaultValue().?.?}),
+            .int => std.fmt.comptimePrint("{d}", .{field.defaultValue().?.?}),
+            .interface => null,
+            .slice => unreachable,
+            .string => std.fmt.comptimePrint("{s}", .{field.defaultValue().?.?}),
+            .string_enum => @tagName(field.defaultValue().?.?),
+        },
         .slice => |elem_kind| {
             return comptime blk: {
                 var out: []const u8 = "[";
@@ -1117,13 +1167,14 @@ fn get_default_text(comptime kind: ValueKind, comptime field: std.builtin.Type.S
                         out = out ++ ", ";
                     }
                     out = out ++ switch (elem_kind.*) {
+                        .bool => unreachable,
                         .float => std.fmt.comptimePrint("{}", .{elem}),
                         .int => std.fmt.comptimePrint("{d}", .{elem}),
+                        .interface => return null,
+                        .optional => unreachable,
+                        .slice => unreachable,
                         .string => std.fmt.comptimePrint("{s}", .{elem}),
                         .string_enum => @tagName(elem),
-                        else => {
-                            return null;
-                        },
                     };
                 }
                 break :blk out ++ "]";
@@ -1317,15 +1368,10 @@ pub fn main(init: std.process.Init) !void {
         .name = "kickass",
     });
 
-    // const fields = std.meta.tags(Option(MyApp));
-    // for (fields) |field| {
-    //     std.debug.print("{s}\t{d}\t{d}\n", .{ @tagName(field), @intFromEnum(field), @intFromEnum(field) & 0xFFFFFFFF });
-    // }
-
     app.subcommand(.Foo, .{
         .summary = "Foo command",
         .name = "fx",
-        // .subcommands_only = true,
+        // .supports_positional_args = false,
         // .max_args = 1,
     });
     // app.option(.Foo_baz, .{ .summary = "option" });
