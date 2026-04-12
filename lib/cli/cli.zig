@@ -21,8 +21,9 @@ pub fn AppOptions(comptime RootCommand: type) type {
         enable_help_command: bool = false,
         env_var_prefix: ?[]const u8 = null,
         epilog: ?[]const u8 = null,
-        help_heading_style: []const u8 = "\x1b[1;38;2;255;183;77m", // Plain alt: "\x1b[33;1m"
-        help_heading_style_end: []const u8 = "\x1b[0m",
+        global_epilog: ?[]const u8 = null,
+        global_prolog: ?[]const u8 = null,
+        help_style: HelpStyle = .{},
         print_deprecations: ?*const fn (Allocator, *std.Io.Writer, app_name: []const u8, []const Deprecation) anyerror!void = null,
         print_error: ?*const fn (Allocator, *std.Io.Writer, app_name: []const u8, ErrorResult) anyerror!void = null,
         print_help: ?*const fn (Allocator, *std.Io.Writer, HelpContext) anyerror!void = null,
@@ -58,7 +59,6 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         dotted_path: []const u8,
         env_var: ?[]const u8 = null,
         group: ?OptionGroup = null,
-        has_default: bool,
         hidden: bool = false,
         id: usize,
         inherited: bool = false,
@@ -66,15 +66,17 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         kind: ValueKind,
         long: []const u8,
         mutually_exclusive_with: []const usize = &.{},
+        negated: bool = false,
         parent_command: usize = 0,
         required: bool = false,
-        show_default: ?bool = null,
         summary: ?[]const u8 = null,
+        validate: ?*const fn (Allocator, *RootCommand) ?[]const u8 = null,
         value_label: ?[]const u8 = null,
     };
 
     const ResolvedCommand = struct {
         const Self = @This();
+        action: BuiltinAction = .none,
         aliases: []*Self = &.{},
         complete: ?Completer(RootCommand) = null,
         deprecated: ?[]const u8 = null,
@@ -91,10 +93,12 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         max_args: ?usize = null,
         min_args: ?usize = null,
         name: []const u8,
+        parent_command: usize = 0,
         preserve_unmatched_short_options: bool = false,
         prolog: ?[]const u8 = null,
         short_flags: std.AutoHashMapUnmanaged(u8, *ResolvedOption) = .empty,
         subcommands: std.StringHashMapUnmanaged(*Self) = .empty,
+        subcommands_only: bool = false,
         summary: ?[]const u8 = null,
         supports_positional_args: ?bool = null,
         usage: ?Usage = null,
@@ -152,6 +156,16 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 .subcommand_meta = subcommand_meta,
                 .subcommands = .{null} ** subcommands_count,
             };
+        }
+
+        pub fn exit(self: *Self, allocator: Allocator, io: std.Io, message: []const u8) noreturn {
+            print_error(allocator, io, self.app_options.name, .{ .raw = message }, self.app_options.print_error orelse default_print_error);
+            std.process.exit(1);
+        }
+
+        pub fn exitf(self: *Self, allocator: Allocator, io: std.Io, comptime format: []const u8, args: anytype) noreturn {
+            const message = std.fmt.allocPrint(allocator, format, args) catch oom(self.app_options.name);
+            self.exit(allocator, io, message);
         }
 
         pub fn option(self: *Self, opt: Option(RootCommand), info: OptionInfo(RootCommand, OptionGroup)) void {
@@ -225,11 +239,11 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             var buf: [64]u8 = undefined;
             var stdout = std.Io.File.stdout().writer(io, &buf);
             const w = &stdout.interface;
-            try self.print_help_to(allocator, w, cmd);
+            try self.print_help_to(allocator, io, w, cmd);
         }
 
-        pub fn print_help_to(self: *Self, allocator: Allocator, w: *std.Io.Writer, cmd: InvokedCommand(RootCommand)) !void {
-            const ctx = self.build_help_context(cmd);
+        pub fn print_help_to(self: *Self, allocator: Allocator, io: std.Io, w: *std.Io.Writer, cmd: InvokedCommand(RootCommand)) !void {
+            const ctx = self.build_help_context(allocator, io, cmd);
             if (self.app_options.print_help) |print| {
                 try print(allocator, w, ctx);
             } else {
@@ -245,25 +259,200 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             self.subcommands[@intFromEnum(cmd)] = info;
         }
 
-        fn build_help_context(self: *Self, cmd: InvokedCommand(RootCommand)) HelpContext {
-            _ = cmd;
+        fn build_help_context(self: *Self, allocator: Allocator, io: std.Io, invoked: InvokedCommand(RootCommand)) HelpContext {
+            const resolved = switch (self.resolve_definitions(allocator)) {
+                .ok => |r| r,
+                .err => |e| {
+                    const err: ErrorResult = .{ .validation = e };
+                    print_error(allocator, io, self.app_options.name, err, self.app_options.print_error orelse default_print_error);
+                    std.process.exit(1);
+                },
+            };
+            const id = @intFromEnum(invoked);
+            const cmd = get_command(resolved, id);
+
+            // Compute the command path.
+            var path: std.ArrayList([]const u8) = .empty;
+            var cur: ?*ResolvedCommand = cmd;
+            while (cur) |c| {
+                path.append(allocator, c.name) catch oom(self.app_options.name);
+                if (c == resolved.root) {
+                    break;
+                }
+                cur = get_command(resolved, c.parent_command);
+            }
+            std.mem.reverse([]const u8, path.items);
+            const command_path = std.mem.join(allocator, " ", path.items) catch oom(self.app_options.name);
+
+            // Normalize the usage text.
+            const usage = if (cmd.usage) |cmd_usage| switch (cmd_usage) {
+                .args => |args| std.fmt.allocPrint(allocator, "{s} {s}", .{ command_path, args }) catch oom(self.app_options.name),
+                .full_text => |text| text,
+            } else null;
+
+            // Compute and group subcommands.
+            var max_subcommand_width: usize = 0;
+            var ungrouped_subcmds: std.ArrayList(SubcommandHelpEntry) = .empty;
+            var grouped_subcmds: std.ArrayList(GroupBucket(SubcommandHelpEntry)) = .empty;
+            var subcmd_it = cmd.subcommands.valueIterator();
+            while (subcmd_it.next()) |subcmd_ptr| {
+                const subcmd = subcmd_ptr.*;
+                if (subcmd.hidden or subcmd.is_alias or subcmd.is_stub) {
+                    continue;
+                }
+                const entry = SubcommandHelpEntry{
+                    .deprecated = subcmd.deprecated,
+                    .name = subcmd.name,
+                    .summary = subcmd.summary,
+                };
+                max_subcommand_width = @max(max_subcommand_width, subcmd.name.len);
+                if (SubcommandGroup != void) {
+                    if (subcmd.group) |group| {
+                        const name = @tagName(group);
+                        const order = @intFromEnum(group);
+                        for (grouped_subcmds.items) |*bucket| {
+                            if (std.mem.eql(u8, bucket.name, name)) {
+                                bucket.items.append(allocator, entry) catch oom(self.app_options.name);
+                                break;
+                            }
+                        } else {
+                            var bucket = GroupBucket(SubcommandHelpEntry){
+                                .items = .empty,
+                                .name = name,
+                                .order = order,
+                            };
+                            bucket.items.append(allocator, entry) catch oom(self.app_options.name);
+                            grouped_subcmds.append(allocator, bucket) catch oom(self.app_options.name);
+                        }
+                        continue;
+                    }
+                }
+                ungrouped_subcmds.append(allocator, entry) catch oom(self.app_options.name);
+            }
+            std.mem.sort(GroupBucket(SubcommandHelpEntry), grouped_subcmds.items, {}, struct {
+                fn lt(_: void, a: GroupBucket(SubcommandHelpEntry), b: GroupBucket(SubcommandHelpEntry)) bool {
+                    return a.order < b.order;
+                }
+            }.lt);
+            const sort_subcmd = struct {
+                fn lt(_: void, a: SubcommandHelpEntry, b: SubcommandHelpEntry) bool {
+                    return std.mem.order(u8, a.name, b.name) == .lt;
+                }
+            }.lt;
+            var subcommand_groups: std.ArrayList(Group(SubcommandHelpEntry)) = .empty;
+            if (ungrouped_subcmds.items.len > 0) {
+                std.mem.sort(SubcommandHelpEntry, ungrouped_subcmds.items, {}, sort_subcmd);
+                subcommand_groups.append(allocator, .{
+                    .items = ungrouped_subcmds.items,
+                    .name = "",
+                }) catch oom(self.app_options.name);
+            }
+            for (grouped_subcmds.items) |group| {
+                std.mem.sort(SubcommandHelpEntry, group.items.items, {}, sort_subcmd);
+                subcommand_groups.append(allocator, .{
+                    .items = group.items.items,
+                    .name = group.name,
+                }) catch oom(self.app_options.name);
+            }
+
+            // Compute and group options.
+            var max_option_width: usize = 0;
+            var ungrouped_opts: std.ArrayList(OptionHelpEntry) = .empty;
+            var global_opts: std.ArrayList(OptionHelpEntry) = .empty;
+            var grouped_opts: std.ArrayList(GroupBucket(OptionHelpEntry)) = .empty;
+            var opt_it = cmd.long_flags.valueIterator();
+            while (opt_it.next()) |opt_ptr| {
+                const opt = opt_ptr.*;
+                if (opt.hidden or opt.is_alias) {
+                    continue;
+                }
+                const short = if (self.options[opt.id]) |info| info.short else null;
+                const entry = OptionHelpEntry{
+                    .default_text = opt.default_text,
+                    .deprecated = opt.deprecated,
+                    .long = opt.long,
+                    .required = opt.required,
+                    .short = short,
+                    .summary = opt.summary,
+                    .value_label = opt.value_label,
+                };
+                max_option_width = @max(max_option_width, opt.long.len);
+                if (opt.inherited) {
+                    global_opts.append(allocator, entry) catch oom(self.app_options.name);
+                    continue;
+                }
+                if (OptionGroup != void) {
+                    if (opt.group) |group| {
+                        const name = @tagName(group);
+                        const order = @intFromEnum(group);
+                        for (grouped_opts.items) |*bucket| {
+                            if (std.mem.eql(u8, bucket.name, name)) {
+                                bucket.items.append(allocator, entry) catch oom(self.app_options.name);
+                                break;
+                            }
+                        } else {
+                            var bucket = GroupBucket(OptionHelpEntry){
+                                .items = .empty,
+                                .name = name,
+                                .order = order,
+                            };
+                            bucket.items.append(allocator, entry) catch oom(self.app_options.name);
+                            grouped_opts.append(allocator, bucket) catch oom(self.app_options.name);
+                        }
+                        continue;
+                    }
+                }
+                ungrouped_opts.append(allocator, entry) catch oom(self.app_options.name);
+            }
+            std.mem.sort(GroupBucket(OptionHelpEntry), grouped_opts.items, {}, struct {
+                fn lt(_: void, a: GroupBucket(OptionHelpEntry), b: GroupBucket(OptionHelpEntry)) bool {
+                    return a.order < b.order;
+                }
+            }.lt);
+            const sort_opt = struct {
+                fn lt(_: void, a: OptionHelpEntry, b: OptionHelpEntry) bool {
+                    return std.mem.order(u8, a.long, b.long) == .lt;
+                }
+            }.lt;
+            var option_groups: std.ArrayList(Group(OptionHelpEntry)) = .empty;
+            if (ungrouped_opts.items.len > 0) {
+                std.mem.sort(OptionHelpEntry, ungrouped_opts.items, {}, sort_opt);
+                option_groups.append(allocator, .{
+                    .items = ungrouped_opts.items,
+                    .name = "",
+                }) catch oom(self.app_options.name);
+            }
+            if (global_opts.items.len > 0) {
+                std.mem.sort(OptionHelpEntry, global_opts.items, {}, sort_opt);
+                option_groups.append(allocator, .{
+                    .items = global_opts.items,
+                    .name = "Global",
+                }) catch oom(self.app_options.name);
+            }
+            for (grouped_opts.items) |group| {
+                std.mem.sort(OptionHelpEntry, group.items.items, {}, sort_opt);
+                option_groups.append(allocator, .{
+                    .items = group.items.items,
+                    .name = group.name,
+                }) catch oom(self.app_options.name);
+            }
+
             return .{
                 .app_name = self.app_options.name,
                 .command = .{
-                    .description = null,
-                    .epilog = null,
-                    .prolog = null,
-                    .summary = null,
-                    .usage = null,
+                    .description = cmd.description,
+                    .epilog = cmd.epilog,
+                    .prolog = cmd.prolog,
+                    .summary = cmd.summary,
+                    .usage = usage,
                 },
-                .heading_style = self.app_options.help_heading_style,
-                .heading_style_end = self.app_options.help_heading_style_end,
-                .command_path = "",
-                .max_option_width = 0,
-                .max_subcommand_width = 0,
-                .option_groups = &.{},
-                .subcommand_groups = &.{},
-                .terminal_width = 0,
+                .command_path = command_path,
+                .max_option_width = max_option_width,
+                .max_subcommand_width = max_subcommand_width,
+                .option_groups = option_groups.items,
+                .subcommand_groups = subcommand_groups.items,
+                .style = self.app_options.help_style,
+                .terminal_width = 80,
             };
         }
 
@@ -278,6 +467,95 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                     return .{ .option = self.option_meta[i].dotted_path };
                 }
             }
+            return null;
+        }
+
+        fn copy_inherited_options(self: *Self, comptime field_name: []const u8, comptime fmt: []const u8, allocator: Allocator, source: *ResolvedCommand, target: *ResolvedCommand) ?ValidationError {
+            var it = @field(source, field_name).iterator();
+            while (it.next()) |entry| {
+                if (!entry.value_ptr.*.inherited) {
+                    continue;
+                }
+                if (@field(target, field_name).get(entry.key_ptr.*)) |existing| {
+                    if (existing.id != entry.value_ptr.*.id) {
+                        return .{
+                            .option = .{
+                                .message = std.fmt.allocPrint(allocator, "shadows inherited option {s}: " ++ fmt, .{ entry.value_ptr.*.dotted_path, entry.key_ptr.* }) catch oom(self.app_options.name),
+                                .option_name = existing.dotted_path,
+                            },
+                        };
+                    }
+                    continue;
+                }
+                @field(target, field_name).put(allocator, entry.key_ptr.*, entry.value_ptr.*) catch oom(self.app_options.name);
+            }
+            return null;
+        }
+
+        fn propagate_inherited_options(self: *Self, allocator: Allocator, cmd: *ResolvedCommand) ?ValidationError {
+            var subcommands = cmd.subcommands.valueIterator();
+            while (subcommands.next()) |subcmd_ptr| {
+                const subcmd = subcmd_ptr.*;
+                if (subcmd.is_stub or subcmd.is_alias) {
+                    continue;
+                }
+                if (self.copy_inherited_options("long_flags", "\"--{s}\"", allocator, cmd, subcmd)) |err| return err;
+                if (self.copy_inherited_options("short_flags", "\"-{c}\"", allocator, cmd, subcmd)) |err| return err;
+                for (subcmd.aliases) |alias| {
+                    if (self.copy_inherited_options("long_flags", "\"--{s}\"", allocator, subcmd, alias)) |err| return err;
+                    if (self.copy_inherited_options("short_flags", "\"-{c}\"", allocator, subcmd, alias)) |err| return err;
+                }
+                if (self.propagate_inherited_options(allocator, subcmd)) |err| {
+                    return err;
+                }
+            }
+            return null;
+        }
+
+        fn register_builtin_subcommand(self: *Self, allocator: Allocator, root: *ResolvedCommand, action: BuiltinAction, name: []const u8, summary: []const u8) ?ValidationError {
+            const cmd = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
+            cmd.* = .{
+                .action = action,
+                .dotted_path = name,
+                .epilog = self.app_options.global_epilog,
+                .id = 0,
+                .is_stub = true,
+                .name = name,
+                .prolog = self.app_options.global_prolog,
+                .summary = summary,
+                .supports_positional_args = false,
+            };
+            if (root.subcommands.get(name)) |existing| {
+                return .{
+                    .subcommand = .{
+                        .message = std.fmt.allocPrint(allocator, "conflicts with auto-generated {s} subcommand", .{name}) catch oom(self.app_options.name),
+                        .subcommand_name = existing.dotted_path,
+                    },
+                };
+            }
+            root.subcommands.put(allocator, name, cmd) catch oom(self.app_options.name);
+            return null;
+        }
+
+        fn register_negated_option(self: *Self, allocator: Allocator, cmd: *ResolvedCommand, opt: *ResolvedOption, flag: []const u8, comptime label: []const u8) ?ValidationError {
+            const clone = allocator.create(ResolvedOption) catch oom(self.app_options.name);
+            clone.* = opt.*;
+            clone.hidden = true;
+            clone.long = std.fmt.allocPrint(allocator, "no-{s}", .{flag}) catch oom(self.app_options.name);
+            clone.negated = true;
+            if (cmd.long_flags.get(clone.long)) |existing| {
+                const existing_status = if (existing.is_alias)
+                    "alias"
+                else
+                    "definition";
+                return .{
+                    .option = .{
+                        .message = std.fmt.allocPrint(allocator, "negated " ++ label ++ " conflicts with existing {s} for {s}: \"{s}\"", .{ existing_status, existing.dotted_path, clone.long }) catch oom(self.app_options.name),
+                        .option_name = opt.dotted_path,
+                    },
+                };
+            }
+            cmd.long_flags.put(allocator, clone.long, clone) catch oom(self.app_options.name);
             return null;
         }
 
@@ -299,132 +577,140 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 .supports_positional_args = self.app_options.supports_positional_args,
                 .usage = self.app_options.usage,
             };
+            if (self.app_options.global_epilog != null and root.epilog == null) {
+                root.epilog = self.app_options.global_epilog;
+            }
+            if (self.app_options.global_prolog != null and root.prolog == null) {
+                root.prolog = self.app_options.global_prolog;
+            }
             var aliased: std.ArrayList(Alias) = .empty;
             var resolved = Resolved{
                 .options = .{undefined} ** options_count,
                 .root = root,
                 .subcommands = .{undefined} ** subcommands_count,
             };
-            for (self.subcommands, self.subcommand_meta, 0..) |s, meta, i| {
-                const info = s orelse SubcommandInfo(RootCommand, SubcommandGroup){};
-                const cmd = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
-                cmd.* = .{
-                    .complete = info.complete,
-                    .deprecated = info.deprecated,
-                    .description = info.description,
-                    .dotted_path = meta.dotted_path,
-                    .epilog = info.epilog,
-                    .group = info.group,
-                    .hidden = info.hidden,
-                    .id = i + 1,
-                    .max_args = info.max_args,
-                    .min_args = info.min_args,
-                    .name = info.name orelse meta.name,
-                    .preserve_unmatched_short_options = info.preserve_unmatched_short_options,
-                    .prolog = info.prolog,
-                    .summary = info.summary,
-                    .supports_positional_args = info.supports_positional_args,
-                    .usage = info.usage,
-                };
-                const parent = if (meta.parent_command == 0)
-                    resolved.root
-                else
-                    resolved.subcommands[meta.parent_command - 1];
-                if (parent.subcommands.get(cmd.name)) |existing| {
-                    const this_status = if (info.name == null)
-                        "inferred "
-                    else
-                        "";
-                    const existing_status = if (existing.is_stub)
-                        "stubbed alias"
-                    else if (existing.is_alias)
-                        "alias"
-                    else if (self.subcommands[existing.id - 1]) |existing_info|
-                        if (existing_info.name == null)
-                            "name inferred"
-                        else
-                            "name defined"
-                    else
-                        "name inferred";
-                    return .{
-                        .err = .{
-                            .subcommand = .{
-                                .message = std.fmt.allocPrint(allocator, "{s}subcommand name conflicts with {s} for {s}: {s}", .{ this_status, existing_status, existing.dotted_path, cmd.name }) catch oom(self.app_options.name),
-                                .subcommand_name = meta.dotted_path,
-                            },
-                        },
-                    };
-                }
-                if (cmd.name.len == 0) {
-                    return .{
-                        .err = .{
-                            .subcommand = .{
-                                .message = "`name` is an empty string",
-                                .subcommand_name = cmd.dotted_path,
-                            },
-                        },
-                    };
-                }
-                if (cmd.supports_positional_args == false) {
-                    if (cmd.min_args) |min_args| {
-                        if (min_args > 0) {
-                            return .{
-                                .err = .{
-                                    .subcommand = .{
-                                        .message = "cannot set `min_args` while `supports_positional_args` is false",
-                                        .subcommand_name = cmd.dotted_path,
-                                    },
-                                },
-                            };
-                        }
-                    }
-                    if (cmd.max_args) |max_args| {
-                        if (max_args > 0) {
-                            return .{
-                                .err = .{
-                                    .subcommand = .{
-                                        .message = "cannot set `max_args` while `supports_positional_args` is false",
-                                        .subcommand_name = cmd.dotted_path,
-                                    },
-                                },
-                            };
-                        }
-                    }
-                }
-                parent.subcommands.put(allocator, cmd.name, cmd) catch oom(self.app_options.name);
-                if (info.aliases.len > 0) {
-                    aliased.append(allocator, .{
-                        .aliases = info.aliases,
-                        .subcommand = cmd,
-                    }) catch oom(self.app_options.name);
-                }
-                resolved.subcommands[i] = cmd;
-            }
-            // default_text: ?[]const u8 = null,
-            // required: bool = false,
-            // show_default: ?bool = null,
 
-            // supports_cli_text: bool,
+            // Resolve subcommands.
+            if (subcommands_count > 0) {
+                for (self.subcommands, self.subcommand_meta, 0..) |s, meta, i| {
+                    const info = s orelse SubcommandInfo(RootCommand, SubcommandGroup){};
+                    const cmd = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
+                    cmd.* = .{
+                        .complete = info.complete,
+                        .deprecated = info.deprecated,
+                        .description = info.description,
+                        .dotted_path = meta.dotted_path,
+                        .epilog = info.epilog,
+                        .group = info.group,
+                        .hidden = info.hidden,
+                        .id = i + 1,
+                        .max_args = info.max_args,
+                        .min_args = info.min_args,
+                        .name = info.name orelse meta.name,
+                        .parent_command = meta.parent_command,
+                        .preserve_unmatched_short_options = info.preserve_unmatched_short_options,
+                        .prolog = info.prolog,
+                        .summary = info.summary,
+                        .supports_positional_args = info.supports_positional_args,
+                        .usage = info.usage,
+                    };
+                    if (self.app_options.global_epilog != null and cmd.epilog == null) {
+                        cmd.epilog = self.app_options.global_epilog;
+                    }
+                    if (self.app_options.global_prolog != null and cmd.prolog == null) {
+                        cmd.prolog = self.app_options.global_prolog;
+                    }
+                    const parent = get_command(resolved, cmd.parent_command);
+                    if (parent.subcommands.get(cmd.name)) |existing| {
+                        const this_status = if (info.name == null)
+                            "inferred "
+                        else
+                            "";
+                        const existing_status = if (existing.is_stub)
+                            "stubbed alias"
+                        else if (existing.is_alias)
+                            "alias"
+                        else if (self.subcommands[existing.id - 1]) |existing_info|
+                            if (existing_info.name == null)
+                                "name inferred"
+                            else
+                                "name defined"
+                        else
+                            "name inferred";
+                        return .{
+                            .err = .{
+                                .subcommand = .{
+                                    .message = std.fmt.allocPrint(allocator, "{s}subcommand name conflicts with {s} for {s}: {s}", .{ this_status, existing_status, existing.dotted_path, cmd.name }) catch oom(self.app_options.name),
+                                    .subcommand_name = meta.dotted_path,
+                                },
+                            },
+                        };
+                    }
+                    if (cmd.name.len == 0) {
+                        return .{
+                            .err = .{
+                                .subcommand = .{
+                                    .message = "`name` is an empty string",
+                                    .subcommand_name = cmd.dotted_path,
+                                },
+                            },
+                        };
+                    }
+                    if (cmd.supports_positional_args == false) {
+                        if (cmd.min_args) |min_args| {
+                            if (min_args > 0) {
+                                return .{
+                                    .err = .{
+                                        .subcommand = .{
+                                            .message = "cannot set `min_args` while `supports_positional_args` is false",
+                                            .subcommand_name = cmd.dotted_path,
+                                        },
+                                    },
+                                };
+                            }
+                        }
+                        if (cmd.max_args) |max_args| {
+                            if (max_args > 0) {
+                                return .{
+                                    .err = .{
+                                        .subcommand = .{
+                                            .message = "cannot set `max_args` while `supports_positional_args` is false",
+                                            .subcommand_name = cmd.dotted_path,
+                                        },
+                                    },
+                                };
+                            }
+                        }
+                    }
+                    parent.subcommands.put(allocator, cmd.name, cmd) catch oom(self.app_options.name);
+                    if (info.aliases.len > 0) {
+                        aliased.append(allocator, .{
+                            .aliases = info.aliases,
+                            .subcommand = cmd,
+                        }) catch oom(self.app_options.name);
+                    }
+                    resolved.subcommands[i] = cmd;
+                }
+            }
+
+            // Resolve options.
             for (self.options, self.option_meta, 0..) |o, meta, i| {
                 const info = o orelse OptionInfo(RootCommand, OptionGroup){};
                 const opt = allocator.create(ResolvedOption) catch oom(self.app_options.name);
                 opt.* = .{
                     .complete = info.complete,
                     .decode = meta.decode,
-                    // .default_text = info.default_text orelse meta.default_text,
                     .deprecated = info.deprecated,
                     .dotted_path = meta.dotted_path,
                     .group = info.group,
-                    .has_default = meta.has_default,
                     .hidden = info.hidden,
                     .id = i,
                     .inherited = info.inherited,
                     .kind = meta.kind,
                     .long = info.long orelse meta.long,
                     .parent_command = meta.parent_command,
-                    // .required = info.required,
-                    // .show_default = info.show_default,
                     .summary = info.summary,
+                    .validate = info.validate,
                     .value_label = info.value_label,
                 };
                 if (info.env_var) |env_var| {
@@ -437,16 +723,61 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                         opt.env_var = std.fmt.allocPrint(allocator, "{s}_{s}", .{ prefix, suffix }) catch oom(self.app_options.name);
                     }
                 }
-                if (needs_default_text(meta.kind, self.app_options.show_defaults, info.show_default)) {
-                    if (!meta.supports_cli_text) {
+                if (!meta.has_default) {
+                    if (info.required != null and info.required.? == false) {
                         return .{
                             .err = .{
                                 .option = .{
-                                    .message = "missing default text for custom data type without a `format` method",
-                                    .option_name = meta.dotted_path,
+                                    .message = "`required` is set to false but field has no default value",
+                                    .option_name = opt.dotted_path,
                                 },
                             },
                         };
+                    }
+                    switch (opt.kind) {
+                        .bool, .slice => {},
+                        else => opt.required = true,
+                    }
+                } else if (info.required != null and info.required.? == true) {
+                    opt.required = true;
+                }
+                if (info.show_default != false and (self.app_options.show_defaults == true or info.show_default == true)) {
+                    if (opt.kind == .bool) {
+                        if (info.show_default == true) {
+                            if (info.default_text) |text| {
+                                opt.default_text = text;
+                            } else if (meta.default_text) |text| {
+                                opt.default_text = text;
+                            } else {
+                                opt.default_text = "false";
+                            }
+                        }
+                    } else if (opt.kind == .slice and !meta.has_default) {
+                        if (info.show_default == true) {
+                            if (info.default_text) |text| {
+                                opt.default_text = text;
+                            } else {
+                                opt.default_text = "[]";
+                            }
+                        }
+                    } else if (meta.has_default) {
+                        if (info.default_text) |text| {
+                            opt.default_text = text;
+                        } else if (meta.default_text) |text| {
+                            opt.default_text = text;
+                        } else if (!meta.format_cli) {
+                            return .{
+                                .err = .{
+                                    .option = .{
+                                        .message = "missing default text for custom data type without a `format_cli` method",
+                                        .option_name = meta.dotted_path,
+                                    },
+                                },
+                            };
+                        }
+                    }
+                    if (opt.default_text != null and opt.default_text.?.len == 0) {
+                        opt.default_text = "\"\"";
                     }
                 }
                 const depends_on = allocator.alloc(usize, info.depends_on.len) catch oom(self.app_options.name);
@@ -459,16 +790,23 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                     mutually_exclusive_with[j] = @intFromEnum(dep);
                 }
                 opt.mutually_exclusive_with = mutually_exclusive_with;
-                const cmd = if (opt.parent_command == 0)
-                    root
-                else
-                    resolved.subcommands[opt.parent_command - 1];
+                const cmd = get_command(resolved, opt.parent_command);
                 if (info.short) |short| {
                     if (is_invalid_short_flag(short)) {
                         return .{
                             .err = .{
                                 .option = .{
                                     .message = std.fmt.allocPrint(allocator, "`short` value is invalid: \"{c}\" (0x{x:0>2})", .{ short, short }) catch oom(self.app_options.name),
+                                    .option_name = opt.dotted_path,
+                                },
+                            },
+                        };
+                    }
+                    if (short == 'h') {
+                        return .{
+                            .err = .{
+                                .option = .{
+                                    .message = "`short` value conflicts with the built-in \"-h\" flag",
                                     .option_name = opt.dotted_path,
                                 },
                             },
@@ -486,210 +824,288 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                     }
                     cmd.short_flags.put(allocator, short, opt) catch oom(self.app_options.name);
                 }
-                if (opt.long.len == 0) {
-                    return .{
-                        .err = .{
-                            .option = .{
-                                .message = "`long` is an empty string",
-                                .option_name = opt.dotted_path,
-                            },
-                        },
-                    };
-                }
-                if (opt.long[0] == '-') {
-                    return .{
-                        .err = .{
-                            .option = .{
-                                .message = "`long` starts with a hyphen",
-                                .option_name = opt.dotted_path,
-                            },
-                        },
-                    };
-                }
                 const this_status = if (info.long == null)
                     "inferred "
                 else
                     "";
-                if (opt.long.len == 1) {
-                    return .{
-                        .err = .{
-                            .option = .{
-                                .message = std.fmt.allocPrint(allocator, "{s}`long` is a single character", .{this_status}) catch oom(self.app_options.name),
-                                .option_name = opt.dotted_path,
-                            },
-                        },
-                    };
-                }
-                if (is_invalid_long_flag(opt.long)) |char| {
-                    return .{
-                        .err = .{
-                            .option = .{
-                                .message = std.fmt.allocPrint(allocator, "{s}`long` contains an invalid character: \"{c}\" (0x{x:0>2})", .{ this_status, char, char }) catch oom(self.app_options.name),
-                                .option_name = opt.dotted_path,
-                            },
-                        },
-                    };
-                }
-                if (cmd.long_flags.get(opt.long)) |existing| {
-                    const existing_status = if (existing.is_alias)
-                        "alias"
-                    else
-                        "definition";
-                    return .{
-                        .err = .{
-                            .option = .{
-                                .message = std.fmt.allocPrint(allocator, "{s}`long` value conflicts with existing {s} for {s}: \"{s}\"", .{ this_status, existing_status, existing.dotted_path, opt.long }) catch oom(self.app_options.name),
-                                .option_name = opt.dotted_path,
-                            },
-                        },
-                    };
+                if (self.validate_long_flag(allocator, cmd, opt.long, opt, "`long`", this_status)) |err| {
+                    return .{ .err = err };
                 }
                 cmd.long_flags.put(allocator, opt.long, opt) catch oom(self.app_options.name);
+                var negatable = false;
+                if (opt.kind == .bool) {
+                    if (info.negatable == null) {
+                        negatable = meta.has_default and std.mem.eql(u8, meta.default_text.?, "true");
+                    } else {
+                        negatable = info.negatable.?;
+                    }
+                } else if (info.negatable != null) {
+                    return .{
+                        .err = .{
+                            .option = .{
+                                .message = "`negatable` is only valid for bool options",
+                                .option_name = opt.dotted_path,
+                            },
+                        },
+                    };
+                }
+                if (negatable) {
+                    if (self.register_negated_option(allocator, cmd, opt, opt.long, "`long` option")) |err| {
+                        return .{ .err = err };
+                    }
+                }
                 for (info.long_aliases) |alias| {
-                    if (alias.len == 0) {
-                        return .{
-                            .err = .{
-                                .option = .{
-                                    .message = "`long_alias` value is an empty string",
-                                    .option_name = opt.dotted_path,
-                                },
-                            },
-                        };
-                    }
-                    if (alias[0] == '-') {
-                        return .{
-                            .err = .{
-                                .option = .{
-                                    .message = "`long_alias` value starts with a hyphen",
-                                    .option_name = opt.dotted_path,
-                                },
-                            },
-                        };
-                    }
-                    if (alias.len == 1) {
-                        return .{
-                            .err = .{
-                                .option = .{
-                                    .message = "`long_alias` value is a single character",
-                                    .option_name = opt.dotted_path,
-                                },
-                            },
-                        };
-                    }
-                    if (is_invalid_long_flag(alias)) |char| {
-                        return .{
-                            .err = .{
-                                .option = .{
-                                    .message = std.fmt.allocPrint(allocator, "`long_alias` value contains an invalid character: \"{c}\" (0x{x:0>2})", .{ char, char }) catch oom(self.app_options.name),
-                                    .option_name = opt.dotted_path,
-                                },
-                            },
-                        };
+                    if (self.validate_long_flag(allocator, cmd, alias, opt, "`long_alias` value", "")) |err| {
+                        return .{ .err = err };
                     }
                     const clone = allocator.create(ResolvedOption) catch oom(self.app_options.name);
                     clone.* = opt.*;
                     clone.hidden = true;
                     clone.is_alias = true;
-                    if (cmd.long_flags.get(alias)) |existing| {
-                        const existing_status = if (existing.is_alias)
-                            "alias"
-                        else
-                            "definition";
-                        return .{
-                            .err = .{
-                                .option = .{
-                                    .message = std.fmt.allocPrint(allocator, "`long_alias` value conflicts with existing {s} for {s}: \"{s}\"", .{ existing_status, existing.dotted_path, alias }) catch oom(self.app_options.name),
-                                    .option_name = opt.dotted_path,
-                                },
-                            },
-                        };
-                    }
                     cmd.long_flags.put(allocator, alias, clone) catch oom(self.app_options.name);
+                    if (negatable) {
+                        if (self.register_negated_option(allocator, cmd, opt, alias, "`long_alias` value")) |err| {
+                            return .{ .err = err };
+                        }
+                    }
                 }
                 resolved.options[i] = opt;
             }
-            // depends_on value {}
-            // mutually_exclusive_with value {}
-            // field {} needs to either be required or have a default value
-            // shadowed inherited option
-            // propagate inherited options (+ to aliased subcommands)
-            for (aliased.items) |a| {
-                var aliases: std.ArrayList(*ResolvedCommand) = .empty;
-                for (a.aliases) |alias| {
-                    const clone = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
-                    clone.* = a.subcommand.*;
-                    clone.is_alias = true;
-                    var parent = root;
-                    var it = std.mem.splitScalar(u8, alias, ' ');
-                    var alias_set = false;
-                    while (it.next()) |part| {
-                        if (part.len == 0) {
-                            continue;
-                        }
-                        const is_last = it.peek() == null;
-                        if (is_last) {
-                            if (parent.subcommands.get(part)) |existing| {
-                                const existing_status = if (existing.is_stub)
-                                    "stubbed alias"
-                                else if (existing.is_alias)
-                                    "alias"
-                                else if (self.subcommands[existing.id - 1]) |existing_info| // NOTE(tav): This depends on the prior check for is_stub for safety.
-                                    if (existing_info.name == null)
-                                        "name inferred"
-                                    else
-                                        "name defined"
-                                else
-                                    "name inferred";
-                                return .{
-                                    .err = .{
-                                        .subcommand = .{
-                                            .message = std.fmt.allocPrint(allocator, "alias conflicts with {s} for {s}: {s}", .{ existing_status, existing.dotted_path, alias }) catch oom(self.app_options.name),
-                                            .subcommand_name = clone.dotted_path,
-                                        },
-                                    },
-                                };
-                            }
-                            clone.name = part;
-                            parent.subcommands.put(allocator, part, clone) catch oom(self.app_options.name);
-                            alias_set = true;
-                            aliases.append(allocator, clone) catch oom(self.app_options.name);
-                        } else {
-                            if (parent.subcommands.get(part)) |existing| {
-                                parent = existing;
-                            } else {
-                                const child = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
-                                child.* = .{
-                                    .dotted_path = clone.dotted_path,
-                                    .hidden = true,
-                                    .id = 0,
-                                    .is_stub = true,
-                                    .name = part,
-                                    .supports_positional_args = false,
-                                };
-                                parent.subcommands.put(allocator, part, child) catch oom(self.app_options.name);
-                                parent = child;
-                            }
-                        }
-                    }
-                    if (!alias_set) {
-                        return .{
-                            .err = .{
-                                .subcommand = .{
-                                    .message = std.fmt.allocPrint(allocator, "invalid alias: `{s}`", .{alias}) catch oom(self.app_options.name),
-                                    .subcommand_name = clone.dotted_path,
-                                },
-                            },
-                        };
-                    }
+
+            // Validate option dependencies.
+            for (resolved.options) |opt| {
+                if (self.validate_option_relations(allocator, resolved, opt, "depends on", opt.depends_on)) |err| {
+                    return .{ .err = err };
                 }
-                a.subcommand.aliases = aliases.toOwnedSlice() catch oom(self.app_options.name);
+                if (self.validate_option_relations(allocator, resolved, opt, "mutually exclusive with", opt.mutually_exclusive_with)) |err| {
+                    return .{ .err = err };
+                }
             }
+
+            // Define subcommand aliases.
+            if (subcommands_count > 0) {
+                for (aliased.items) |a| {
+                    var aliases: std.ArrayList(*ResolvedCommand) = .empty;
+                    for (a.aliases) |alias| {
+                        const clone = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
+                        clone.* = a.subcommand.*;
+                        clone.is_alias = true;
+                        var parent = root;
+                        var it = std.mem.splitScalar(u8, alias, ' ');
+                        var alias_set = false;
+                        while (it.next()) |part| {
+                            if (part.len == 0) {
+                                continue;
+                            }
+                            const is_last = it.peek() == null;
+                            if (is_last) {
+                                if (parent.subcommands.get(part)) |existing| {
+                                    const existing_status = if (existing.is_stub)
+                                        "stubbed alias"
+                                    else if (existing.is_alias)
+                                        "alias"
+                                    else if (self.subcommands[existing.id - 1]) |existing_info| // NOTE(tav): This depends on the prior check for is_stub for safety.
+                                        if (existing_info.name == null)
+                                            "name inferred"
+                                        else
+                                            "name defined"
+                                    else
+                                        "name inferred";
+                                    return .{
+                                        .err = .{
+                                            .subcommand = .{
+                                                .message = std.fmt.allocPrint(allocator, "alias conflicts with {s} for {s}: {s}", .{ existing_status, existing.dotted_path, alias }) catch oom(self.app_options.name),
+                                                .subcommand_name = clone.dotted_path,
+                                            },
+                                        },
+                                    };
+                                }
+                                clone.name = part;
+                                parent.subcommands.put(allocator, part, clone) catch oom(self.app_options.name);
+                                alias_set = true;
+                                aliases.append(allocator, clone) catch oom(self.app_options.name);
+                            } else {
+                                if (parent.subcommands.get(part)) |existing| {
+                                    parent = existing;
+                                } else {
+                                    const child = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
+                                    child.* = .{
+                                        .dotted_path = clone.dotted_path,
+                                        .hidden = true,
+                                        .id = 0,
+                                        .is_stub = true,
+                                        .name = part,
+                                        .supports_positional_args = false,
+                                    };
+                                    parent.subcommands.put(allocator, part, child) catch oom(self.app_options.name);
+                                    parent = child;
+                                }
+                            }
+                        }
+                        if (!alias_set) {
+                            return .{
+                                .err = .{
+                                    .subcommand = .{
+                                        .message = std.fmt.allocPrint(allocator, "invalid alias: `{s}`", .{alias}) catch oom(self.app_options.name),
+                                        .subcommand_name = clone.dotted_path,
+                                    },
+                                },
+                            };
+                        }
+                    }
+                    a.subcommand.aliases = aliases.toOwnedSlice(allocator) catch oom(self.app_options.name);
+                }
+            }
+
+            // Define built-in subcommands.
+            if (self.app_options.enable_completion_command) {
+                if (self.register_builtin_subcommand(allocator, root, .completion, "completion", "Generate shell completion script")) |err| {
+                    return .{ .err = err };
+                }
+            }
+            if (self.app_options.enable_help_command) {
+                if (self.register_builtin_subcommand(allocator, root, .help, "help", "Show help and exit")) |err| {
+                    return .{ .err = err };
+                }
+            }
+            if (self.app_options.version != null) {
+                if (self.register_builtin_subcommand(allocator, root, .version, "version", "Show version and exit")) |err| {
+                    return .{ .err = err };
+                }
+            }
+
+            if (self.propagate_inherited_options(allocator, root)) |err| {
+                return .{ .err = err };
+            }
+            resolve_subcommands_only(root);
             return .{ .ok = resolved };
         }
 
         fn run_completion(self: *Self, shell: []const u8) void {
             _ = self;
             _ = shell;
+        }
+
+        fn validate_long_flag(self: *Self, allocator: Allocator, cmd: *ResolvedCommand, flag: []const u8, opt: *ResolvedOption, comptime label: []const u8, prefix: []const u8) ?ValidationError {
+            if (flag.len == 0) {
+                return .{
+                    .option = .{
+                        .message = label ++ " is an empty string",
+                        .option_name = opt.dotted_path,
+                    },
+                };
+            }
+            if (flag[0] == '-') {
+                return .{
+                    .option = .{
+                        .message = label ++ " starts with a hyphen",
+                        .option_name = opt.dotted_path,
+                    },
+                };
+            }
+            if (std.mem.eql(u8, flag, "help")) {
+                return .{
+                    .option = .{
+                        .message = label ++ " conflicts with the built-in \"--help\" flag",
+                        .option_name = opt.dotted_path,
+                    },
+                };
+            }
+            if (flag.len == 1) {
+                return .{
+                    .option = .{
+                        .message = std.fmt.allocPrint(allocator, "{s}" ++ label ++ " is a single character", .{prefix}) catch oom(self.app_options.name),
+                        .option_name = opt.dotted_path,
+                    },
+                };
+            }
+            if (is_invalid_long_flag(flag)) |char| {
+                return .{
+                    .option = .{
+                        .message = std.fmt.allocPrint(allocator, "{s}" ++ label ++ " contains an invalid character: \"{c}\" (0x{x:0>2})", .{ prefix, char, char }) catch oom(self.app_options.name),
+                        .option_name = opt.dotted_path,
+                    },
+                };
+            }
+            if (cmd.long_flags.get(flag)) |existing| {
+                const existing_status = if (existing.is_alias)
+                    "alias"
+                else
+                    "definition";
+                return .{
+                    .option = .{
+                        .message = std.fmt.allocPrint(allocator, "{s}" ++ label ++ " conflicts with existing {s} for {s}: \"{s}\"", .{ prefix, existing_status, existing.dotted_path, flag }) catch oom(self.app_options.name),
+                        .option_name = opt.dotted_path,
+                    },
+                };
+            }
+            return null;
+        }
+
+        fn validate_option_relations(self: *Self, allocator: Allocator, resolved: Resolved, opt: *ResolvedOption, comptime relation: []const u8, related_ids: []const usize) ?ValidationError {
+            for (related_ids) |dep| {
+                if (dep == opt.id) {
+                    return .{
+                        .option = .{
+                            .message = "option " ++ relation ++ " itself",
+                            .option_name = opt.dotted_path,
+                        },
+                    };
+                }
+                const dep_opt = resolved.options[dep];
+                if (dep_opt.parent_command == opt.parent_command) {
+                    continue;
+                }
+                if (!dep_opt.inherited) {
+                    return .{
+                        .option = .{
+                            .message = std.fmt.allocPrint(allocator, relation ++ " an option that's not inherited: {s}", .{dep_opt.dotted_path}) catch oom(self.app_options.name),
+                            .option_name = opt.dotted_path,
+                        },
+                    };
+                }
+                var cmd: ?*ResolvedCommand = get_command(resolved, opt.parent_command);
+                while (cmd) |c| {
+                    if (dep_opt.parent_command == c.id) {
+                        break;
+                    }
+                    if (c == resolved.root) {
+                        return .{
+                            .option = .{
+                                .message = std.fmt.allocPrint(allocator, relation ++ " an option that's not in its command hierarchy: {s}", .{dep_opt.dotted_path}) catch oom(self.app_options.name),
+                                .option_name = opt.dotted_path,
+                            },
+                        };
+                    }
+                    cmd = get_command(resolved, c.parent_command);
+                }
+            }
+            return null;
+        }
+
+        fn get_command(resolved: Resolved, id: usize) *ResolvedCommand {
+            if (id == 0) {
+                return resolved.root;
+            }
+            if (subcommands_count == 0) unreachable;
+            return resolved.subcommands[id - 1];
+        }
+
+        fn resolve_subcommands_only(cmd: *ResolvedCommand) void {
+            if (cmd.subcommands.count() > 0) {
+                if (cmd.supports_positional_args != true) {
+                    cmd.supports_positional_args = false;
+                    cmd.subcommands_only = true;
+                    for (cmd.aliases) |alias| {
+                        alias.supports_positional_args = false;
+                        alias.subcommands_only = true;
+                    }
+                }
+            }
+            var subcommands = cmd.subcommands.valueIterator();
+            while (subcommands.next()) |subcmd_ptr| {
+                resolve_subcommands_only(subcmd_ptr.*);
+            }
         }
     };
 }
@@ -701,7 +1117,7 @@ pub const CommandError = struct {
     pub const Kind = union(enum) {
         too_few_args: struct { min_args: usize, usage: []const u8 },
         too_many_args: struct { max_args: usize, usage: []const u8 },
-        unknown_option: struct { option_name: []const u8 },
+        unknown_subcommand: struct { subcommand_name: []const u8, suggestions: []const []const u8 },
     };
 };
 
@@ -760,20 +1176,14 @@ pub const ErrorResult = union(enum) {
     command: CommandError,
     missing_definition: MissingDefinitionError,
     option: OptionError,
+    raw: []const u8,
     validation: ValidationError,
-};
-
-pub const GroupKind = union(enum) {
-    default,
-    global,
-    inherited,
-    named: []const u8,
 };
 
 pub fn Group(comptime T: type) type {
     return struct {
         items: []const T,
-        kind: GroupKind,
+        name: []const u8,
     };
 }
 
@@ -781,13 +1191,20 @@ pub const HelpContext = struct {
     app_name: []const u8,
     command: CommandHelpEntry,
     command_path: []const u8,
-    heading_style: []const u8,
-    heading_style_end: []const u8,
-    max_option_width: u16,
-    max_subcommand_width: u16,
+    max_option_width: usize,
+    max_subcommand_width: usize,
     option_groups: []const Group(OptionHelpEntry),
     subcommand_groups: []const Group(SubcommandHelpEntry),
-    terminal_width: u16,
+    style: HelpStyle,
+    terminal_width: usize,
+};
+
+pub const HelpStyle = struct {
+    heading: []const u8 = "\x1b[1;38;2;255;183;77m", // Plain alt: "\x1b[33;1m"
+    heading_end: []const u8 = "\x1b[0m",
+    indent_options: usize = 4,
+    indent_subcommands: usize = 4,
+    indent_usage: usize = 4,
 };
 
 pub fn InvokedCommand(comptime RootCommand: type) type {
@@ -825,6 +1242,7 @@ pub const OptionError = struct {
         missing_required,
         missing_value,
         mutually_exclusive: struct { related_option_name: []const u8 },
+        unknown_option: struct { suggestions: []const []const u8 },
         unmet_dependency: struct { related_option_name: []const u8 },
     };
 };
@@ -832,7 +1250,6 @@ pub const OptionError = struct {
 pub const OptionHelpEntry = struct {
     default_text: ?[]const u8 = null,
     deprecated: ?[]const u8 = null,
-    hidden: bool = false,
     long: []const u8,
     required: bool = false,
     short: ?u8 = null,
@@ -853,10 +1270,12 @@ pub fn OptionInfo(comptime RootCommand: type, comptime OptionGroup: type) type {
         long: ?[]const u8 = null,
         long_aliases: []const []const u8 = &.{},
         mutually_exclusive_with: []const Option(RootCommand) = &.{},
-        required: bool = false,
+        negatable: ?bool = null,
+        required: ?bool = null,
         short: ?u8 = null,
         show_default: ?bool = null,
         summary: ?[]const u8 = null,
+        validate: ?*const fn (Allocator, *RootCommand) ?[]const u8 = null,
         value_label: ?[]const u8 = null,
     };
 }
@@ -879,7 +1298,6 @@ pub fn Subcommand(comptime RootCommand: type) type {
 
 pub const SubcommandHelpEntry = struct {
     deprecated: ?[]const u8 = null,
-    hidden: bool = false,
     name: []const u8,
     summary: ?[]const u8 = null,
 };
@@ -943,17 +1361,32 @@ pub const WrapSpec = struct {
     width: u32 = 80,
 };
 
+const BuiltinAction = enum {
+    none,
+    completion,
+    help,
+    version,
+};
+
+fn GroupBucket(comptime T: type) type {
+    return struct {
+        items: std.ArrayList(T),
+        name: []const u8,
+        order: usize,
+    };
+}
+
 fn OptionMeta(comptime RootCommand: type) type {
     return struct {
         decode: *const fn (Allocator, *RootCommand, DecodeSource) ?[]const u8,
         default_text: ?[]const u8,
         dotted_path: []const u8,
         field_path: []const []const u8,
+        format_cli: bool,
         has_default: bool,
         kind: ValueKind,
         long: []const u8,
         parent_command: usize,
-        supports_cli_text: bool,
     };
 }
 
@@ -1031,99 +1464,68 @@ const ValueKind = union(enum) {
     }
 
     fn match_cli_interface(comptime T: type, comptime dotted_path: []const u8) bool {
-        if (@hasDecl(T, "cli_text")) {
-            validate_cli_text(T, dotted_path);
+        if (@hasDecl(T, "format_cli")) {
+            validate_format_cli(T, dotted_path);
         }
         if (@hasDecl(T, "decode_cli_arg")) {
-            validate_decode_cli_arg(T, dotted_path);
+            validate_decode_method(T, dotted_path, "decode_cli_arg");
             if (@hasDecl(T, "decode_cli_env")) {
-                validate_decode_cli_env(T, dotted_path);
+                validate_decode_method(T, dotted_path, "decode_cli_env");
             }
             return true;
         }
         return false;
     }
 
-    fn validate_cli_text(comptime T: type, comptime dotted_path: []const u8) void {
-        const err = "Invalid cli interface definition for " ++ @typeName(T) ++ " found in " ++ dotted_path ++ ": .cli_text ";
-        const decl = @typeInfo(@TypeOf(T.cli_text));
+    fn validate_decode_method(comptime T: type, comptime dotted_path: []const u8, comptime method_name: []const u8) void {
+        const err = "Invalid cli interface definition for " ++ @typeName(T) ++ " found in " ++ dotted_path ++ ": ." ++ method_name ++ " ";
+        const decl = @typeInfo(@TypeOf(@field(T, method_name)));
         if (decl != .@"fn") {
             @compileError(err ++ "needs to be a method, not " ++ @tagName(decl));
         }
         const func = decl.@"fn";
         if (func.params.len != 2) {
-            @compileError(err ++ "needs to take exactly 2 parameters: (self: " ++ @typeName(T) ++ ", allocator: mem.Allocator), not " ++ std.fmt.comptimePrint("{d}", .{func.params.len}));
+            @compileError(err ++ "needs to take exactly 2 parameters: (allocator: mem.Allocator, raw: []const u8), not " ++ std.fmt.comptimePrint("{d}", .{func.params.len}));
+        }
+        if (func.params[0].type) |t| {
+            if (t != Allocator) {
+                @compileError(err ++ "first parameter must be mem.Allocator, not " ++ @typeName(t));
+            }
+        }
+        if (func.params[1].type) |t| {
+            if (t != []const u8) {
+                @compileError(err ++ "second parameter must be []const u8, not " ++ @typeName(t));
+            }
+        }
+        const Return = func.return_type orelse @compileError(err ++ "must have a concrete return type");
+        if (Return != DecodeResult(T)) {
+            @compileError(err ++ "must return cli.DecodeResult(" ++ @typeName(T) ++ "), not " ++ @typeName(Return));
+        }
+    }
+
+    fn validate_format_cli(comptime T: type, comptime dotted_path: []const u8) void {
+        const err = "Invalid cli interface definition for " ++ @typeName(T) ++ " found in " ++ dotted_path ++ ": .format_cli ";
+        const decl = @typeInfo(@TypeOf(T.format_cli));
+        if (decl != .@"fn") {
+            @compileError(err ++ "needs to be a method, not " ++ @tagName(decl));
+        }
+        const func = decl.@"fn";
+        if (func.params.len != 1) {
+            @compileError(err ++ "needs to take exactly 1 parameter: (self: " ++ @typeName(T) ++ "), not " ++ std.fmt.comptimePrint("{d}", .{func.params.len}));
         }
         if (func.params[0].type) |t| {
             if (t != T) {
                 @compileError(err ++ "first parameter must be " ++ @typeName(T) ++ ", not " ++ @typeName(t));
             }
         }
-        if (func.params[1].type) |t| {
-            if (t != Allocator) {
-                @compileError(err ++ "second parameter must be mem.Allocator, not " ++ @typeName(t));
-            }
-        }
         const Return = func.return_type orelse @compileError(err ++ "must have a concrete return type");
         switch (@typeInfo(Return)) {
-            .error_union => |info| {
-                if (info.payload != []const u8) {
-                    @compileError(err ++ "must return ![]const u8, not " ++ @typeName(Return));
+            .pointer => |info| {
+                if (!(info.size == .slice and info.child == u8)) {
+                    @compileError(err ++ "must return []const u8, not " ++ @typeName(Return));
                 }
             },
-            else => @compileError(err ++ "must return ![]const u8, not " ++ @typeName(Return)),
-        }
-    }
-
-    fn validate_decode_cli_arg(comptime T: type, comptime dotted_path: []const u8) void {
-        const err = "Invalid cli interface definition for " ++ @typeName(T) ++ " found in " ++ dotted_path ++ ": .decode_cli_arg ";
-        const decl = @typeInfo(@TypeOf(T.decode_cli_arg));
-        if (decl != .@"fn") {
-            @compileError(err ++ "needs to be a method, not " ++ @tagName(decl));
-        }
-        const func = decl.@"fn";
-        if (func.params.len != 2) {
-            @compileError(err ++ "needs to take exactly 2 parameters: (allocator: mem.Allocator, raw: []const u8), not " ++ std.fmt.comptimePrint("{d}", .{func.params.len}));
-        }
-        if (func.params[0].type) |t| {
-            if (t != Allocator) {
-                @compileError(err ++ "first parameter must be mem.Allocator, not " ++ @typeName(t));
-            }
-        }
-        if (func.params[1].type) |t| {
-            if (t != []const u8) {
-                @compileError(err ++ "second parameter must be []const u8, not " ++ @typeName(t));
-            }
-        }
-        const Return = func.return_type orelse @compileError(err ++ "must have a concrete return type");
-        if (Return != DecodeResult(T)) {
-            @compileError(err ++ "must return cli.DecodeResult(" ++ @typeName(T) ++ "), not " ++ @typeName(Return));
-        }
-    }
-
-    fn validate_decode_cli_env(comptime T: type, comptime dotted_path: []const u8) void {
-        const err = "Invalid cli interface definition for " ++ @typeName(T) ++ " found in " ++ dotted_path ++ ": .decode_cli_env ";
-        const decl = @typeInfo(@TypeOf(T.decode_cli_env));
-        if (decl != .@"fn") {
-            @compileError(err ++ "needs to be a method, not " ++ @tagName(decl));
-        }
-        const func = decl.@"fn";
-        if (func.params.len != 2) {
-            @compileError(err ++ "needs to take exactly 2 parameters: (allocator: mem.Allocator, raw: []const u8), not " ++ std.fmt.comptimePrint("{d}", .{func.params.len}));
-        }
-        if (func.params[0].type) |t| {
-            if (t != Allocator) {
-                @compileError(err ++ "first parameter must be mem.Allocator, not " ++ @typeName(t));
-            }
-        }
-        if (func.params[1].type) |t| {
-            if (t != []const u8) {
-                @compileError(err ++ "second parameter must be []const u8, not " ++ @typeName(t));
-            }
-        }
-        const Return = func.return_type orelse @compileError(err ++ "must have a concrete return type");
-        if (Return != DecodeResult(T)) {
-            @compileError(err ++ "must return cli.DecodeResult(" ++ @typeName(T) ++ "), not " ++ @typeName(Return));
+            else => @compileError(err ++ "must return []const u8, not " ++ @typeName(Return)),
         }
     }
 };
@@ -1181,7 +1583,9 @@ fn construct_decode(comptime RootCommand: type, comptime T: type, comptime kind:
                             var list: std.ArrayList(Inner) = .empty;
                             for (vals) |val| {
                                 const elem = blk: switch (inner.*) {
-                                    .bool => unreachable,
+                                    .bool => {
+                                        break :blk true;
+                                    },
                                     .float => {
                                         break :blk std.fmt.parseFloat(Inner, val) catch return "invalid float value";
                                     },
@@ -1234,17 +1638,18 @@ fn construct_meta(comptime RootCommand: type, comptime T: type, comptime prefix:
             const name = prefix ++ "." ++ field.name;
             const kind = ValueKind.from_type(field.type, name, false, false);
             const has_default = field.default_value_ptr != null;
-            const default_text = if (has_default) get_default_text(kind, field) else null;
+            const format_cli = has_format_cli(field.type, kind);
+            const default_text = if (has_default) get_default_text(kind, field, format_cli) else null;
             option_meta[option_idx.*] = .{
                 .decode = construct_decode(RootCommand, field.type, kind, field_path),
                 .default_text = default_text,
                 .dotted_path = name,
                 .field_path = field_path,
+                .format_cli = format_cli,
                 .has_default = has_default,
                 .kind = kind,
                 .long = snake_to_kebab(field.name),
                 .parent_command = parent_command_idx.*,
-                .supports_cli_text = supports_cli_text(field.type, kind),
             };
             option_idx.* += 1;
         }
@@ -1344,7 +1749,12 @@ fn decode_cli_env(comptime T: type, comptime kind: ValueKind, allocator: Allocat
         },
         .optional => |inner| {
             const Inner = std.meta.Child(T);
-            return decode_cli_env(Inner, inner.*, allocator, ptr, val);
+            var raw: Inner = undefined;
+            const err = decode_cli_env(Inner, inner.*, allocator, &raw, val);
+            if (err == null) {
+                ptr.* = raw;
+            }
+            return err;
         },
         .slice => unreachable,
         .string => ptr.* = val,
@@ -1371,25 +1781,75 @@ fn default_print_error(allocator: Allocator, w: *std.Io.Writer, app_name: []cons
     try w.print("\x1b[31mERROR: {s}: ", .{app_name});
     switch (err) {
         .command => |cmd_err| {
-            try w.print("command error: {s} ", .{cmd_err.command_path});
+            switch (cmd_err.kind) {
+                .too_few_args => |args| {
+                    try w.print("not enough arguments for command \"{s}\": needs at least {d} {s}", .{ cmd_err.command_path, args.min_args, pluralize(args.min_args, "argument", "arguments") });
+                },
+                .too_many_args => |args| {
+                    try w.print("too many arguments for command \"{s}\": max is {d} {s}", .{ cmd_err.command_path, args.max_args, pluralize(args.max_args, "argument", "arguments") });
+                },
+                .unknown_subcommand => |unknown| {
+                    try w.print("unknown command: \"{s}\" in \"{s}\"", .{ unknown.subcommand_name, cmd_err.command_path });
+                    if (unknown.suggestions.len > 0) {
+                        try w.print("\n\nDid you mean one of the following?\n\n", .{});
+                        for (unknown.suggestions, 0..) |suggestion, i| {
+                            if (i > 0) {
+                                try w.print("\n", .{});
+                            }
+                            try w.print("\t{s} {s}", .{ cmd_err.command_path, suggestion });
+                        }
+                    }
+                },
+            }
         },
         .missing_definition => |definition| switch (definition) {
             .option => |option_name| {
-                try w.print("missing explicit definition for option: {s} ", .{option_name});
+                try w.print("missing explicit definition for option: {s}", .{option_name});
             },
             .subcommand => |subcommand_name| {
-                try w.print("missing explicit definition for subcommand: {s} ", .{subcommand_name});
+                try w.print("missing explicit definition for subcommand: {s}", .{subcommand_name});
             },
         },
         .option => |opt_err| {
-            try w.print("option error: {s} ", .{opt_err.option_name});
+            switch (opt_err.kind) {
+                .invalid_value => |message| {
+                    try w.print("invalid value for option \"{s}\" in \"{s}\": {s} ", .{ opt_err.option_name, opt_err.command_path, message });
+                },
+                .missing_required => {
+                    try w.print("missing required option: \"{s}\" in \"{s}\"", .{ opt_err.option_name, opt_err.command_path });
+                },
+                .missing_value => {
+                    try w.print("missing value for option \"{s}\" in \"{s}\"", .{ opt_err.option_name, opt_err.command_path });
+                },
+                .mutually_exclusive => |merr| {
+                    try w.print("option \"{s}\" in \"{s}\" is mutually exclusive with \"{s}\"", .{ opt_err.option_name, opt_err.command_path, merr.related_option_name });
+                },
+                .unknown_option => |unknown| {
+                    try w.print("unknown option: \"{s}\" in \"{s}\"", .{ opt_err.option_name, opt_err.command_path });
+                    if (unknown.suggestions.len > 0) {
+                        try w.print("\n\nDid you mean one of the following?\n\n", .{});
+                        for (unknown.suggestions, 0..) |suggestion, i| {
+                            if (i > 0) {
+                                try w.print("\n", .{});
+                            }
+                            try w.print("\t{s} {s}", .{ opt_err.command_path, suggestion });
+                        }
+                    }
+                },
+                .unmet_dependency => |merr| {
+                    try w.print("option \"{s}\" in \"{s}\" also needs \"{s}\"", .{ opt_err.option_name, opt_err.command_path, merr.related_option_name });
+                },
+            }
+        },
+        .raw => |message| {
+            try w.print("{s}", .{message});
         },
         .validation => |validation| switch (validation) {
             .option => |v| {
-                try w.print("invalid option definition for {s}: {s} ", .{ v.option_name, v.message });
+                try w.print("invalid option definition for {s}: {s}", .{ v.option_name, v.message });
             },
             .subcommand => |v| {
-                try w.print("invalid subcommand definition for {s}: {s} ", .{ v.subcommand_name, v.message });
+                try w.print("invalid subcommand definition for {s}: {s}", .{ v.subcommand_name, v.message });
             },
         },
     }
@@ -1399,8 +1859,8 @@ fn default_print_error(allocator: Allocator, w: *std.Io.Writer, app_name: []cons
 
 fn default_print_help(allocator: Allocator, w: *std.Io.Writer, ctx: HelpContext) !void {
     _ = allocator;
-    const heading = ctx.heading_style;
-    const heading_end = ctx.heading_style_end;
+    const heading = ctx.style.heading;
+    const heading_end = ctx.style.heading_end;
     try w.print("{s}USAGE{s}\n", .{ heading, heading_end });
     try w.flush();
 }
@@ -1451,18 +1911,31 @@ fn find_subcommands(comptime T: type, comptime prefix: []const u8) usize {
     return count;
 }
 
-fn get_default_text(comptime kind: ValueKind, comptime field: std.builtin.Type.StructField) ?[]const u8 {
+fn get_default_text(comptime kind: ValueKind, comptime field: std.builtin.Type.StructField, comptime format_cli: bool) ?[]const u8 {
     // NOTE(tav): We bail on any .interface kinds.
     return switch (kind) {
         .bool => if (field.defaultValue().?) "true" else "false",
         .float => std.fmt.comptimePrint("{}", .{field.defaultValue().?}),
         .int => std.fmt.comptimePrint("{d}", .{field.defaultValue().?}),
-        .interface => null,
+        .interface => {
+            if (format_cli) {
+                return field.type.format_cli(field.defaultValue().?);
+            }
+            return null;
+        },
         .optional => |inner| if (field.defaultValue().? == null) "null" else switch (inner.*) {
             .bool => if (field.defaultValue().?.? == true) "true" else "false",
             .float => std.fmt.comptimePrint("{}", .{field.defaultValue().?.?}),
             .int => std.fmt.comptimePrint("{d}", .{field.defaultValue().?.?}),
-            .interface => null,
+            .interface => {
+                if (format_cli) {
+                    const val = field.defaultValue().?;
+                    if (val != null) {
+                        return @typeInfo(field.type).optional.child.format_cli(field.defaultValue().?.?);
+                    }
+                }
+                return null;
+            },
             .slice => unreachable,
             .string => std.fmt.comptimePrint("{s}", .{field.defaultValue().?.?}),
             .string_enum => @tagName(field.defaultValue().?.?),
@@ -1475,10 +1948,15 @@ fn get_default_text(comptime kind: ValueKind, comptime field: std.builtin.Type.S
                         out = out ++ ", ";
                     }
                     out = out ++ switch (elem_kind.*) {
-                        .bool => unreachable,
+                        .bool => if (elem) "true" else "false",
                         .float => std.fmt.comptimePrint("{}", .{elem}),
                         .int => std.fmt.comptimePrint("{d}", .{elem}),
-                        .interface => return null,
+                        .interface => fblk: {
+                            if (format_cli) {
+                                break :fblk @typeInfo(field.type).pointer.child.format_cli(elem);
+                            }
+                            return null;
+                        },
                         .optional => unreachable,
                         .slice => unreachable,
                         .string => std.fmt.comptimePrint("{s}", .{elem}),
@@ -1511,16 +1989,13 @@ fn get_root_field_type(comptime T: type, comptime path: []const []const u8) type
     return typ;
 }
 
-fn kebab_to_screaming_snake(allocator: Allocator, ident: []const u8) ![]const u8 {
-    var buf = try allocator.alloc(u8, ident.len);
-    for (ident, 0..) |c, i| {
-        if (c == '-') {
-            buf[i] = '_';
-        } else {
-            buf[i] = std.ascii.toUpper(c);
-        }
-    }
-    return buf;
+fn has_format_cli(comptime T: type, comptime kind: ValueKind) bool {
+    return switch (kind) {
+        .interface => @hasDecl(T, "format_cli"),
+        .optional => |inner| has_format_cli(@typeInfo(T).optional.child, inner.*),
+        .slice => |inner| has_format_cli(@typeInfo(T).pointer.child, inner.*),
+        else => false,
+    };
 }
 
 fn is_invalid_long_flag(long: []const u8) ?u8 {
@@ -1555,29 +2030,16 @@ fn is_invalid_short_flag(short: u8) bool {
     return true;
 }
 
-fn needs_cli_text(kind: ValueKind) bool {
-    return switch (kind) {
-        .interface => true,
-        .optional => |inner| switch (inner.*) {
-            .interface => true,
-            else => false,
-        },
-        .slice => |inner| switch (inner.*) {
-            .interface => true,
-            else => false,
-        },
-        else => false,
-    };
-}
-
-fn needs_default_text(kind: ValueKind, root_show_defaults: ?bool, opt_show_default: ?bool) bool {
-    if (!needs_cli_text(kind)) {
-        return false;
+fn kebab_to_screaming_snake(allocator: Allocator, ident: []const u8) ![]const u8 {
+    var buf = try allocator.alloc(u8, ident.len);
+    for (ident, 0..) |c, i| {
+        if (c == '-') {
+            buf[i] = '_';
+        } else {
+            buf[i] = std.ascii.toUpper(c);
+        }
     }
-    if (opt_show_default == false) {
-        return false;
-    }
-    return root_show_defaults == true;
+    return buf;
 }
 
 fn oom(app_name: []const u8) noreturn {
@@ -1615,6 +2077,10 @@ fn pascal_to_kebab(comptime ident: []const u8) []const u8 {
     }
 }
 
+fn pluralize(count: usize, singular: []const u8, plural: []const u8) []const u8 {
+    return if (count == 1) singular else plural;
+}
+
 fn print_deprecations(allocator: Allocator, io: std.Io, app_name: []const u8, deprecations: []const Deprecation, print_deprecations_func: *const fn (Allocator, *std.Io.Writer, []const u8, []const Deprecation) anyerror!void) void {
     var buf: [64]u8 = undefined;
     var stderr = std.Io.File.stderr().writer(io, &buf);
@@ -1638,21 +2104,102 @@ fn snake_to_kebab(comptime ident: []const u8) []const u8 {
     }
 }
 
-fn supports_cli_text(comptime T: type, comptime kind: ValueKind) bool {
-    return switch (kind) {
-        .interface => @hasDecl(T, "cli_text"),
-        .optional => |inner| supports_cli_text(@typeInfo(T).optional.child, inner.*),
-        .slice => |inner| supports_cli_text(@typeInfo(T).pointer.child, inner.*),
-        else => false,
-    };
-}
-
 fn unqualified_type_name(comptime T: type) []const u8 {
     const name = @typeName(T);
     return if (std.mem.lastIndexOfScalar(u8, name, '.')) |idx| name[idx + 1 ..] else name;
 }
 
 const testing = std.testing;
+
+fn expect_missing_option(result: anytype, expected_path: []const u8) !void {
+    defer free_ok(result);
+    switch (result) {
+        .err => |err| switch (err) {
+            .missing_definition => |d| switch (d) {
+                .option => |name| try testing.expectEqualStrings(expected_path, name),
+                .subcommand => return error.ExpectedOption,
+            },
+            else => return error.ExpectedMissingDefinition,
+        },
+        .ok => return error.ExpectedError,
+    }
+}
+
+fn expect_missing_subcommand(result: anytype, expected_path: []const u8) !void {
+    defer free_ok(result);
+    switch (result) {
+        .err => |err| switch (err) {
+            .missing_definition => |d| switch (d) {
+                .subcommand => |name| try testing.expectEqualStrings(expected_path, name),
+                .option => return error.ExpectedSubcommand,
+            },
+            else => return error.ExpectedMissingDefinition,
+        },
+        .ok => return error.ExpectedError,
+    }
+}
+
+fn expect_ok(result: anytype) !void {
+    switch (result) {
+        .ok => |r| {
+            r.arena.deinit();
+            testing.allocator.destroy(r.arena);
+        },
+        .err => return error.ExpectedOk,
+    }
+}
+
+fn expect_validation_option_error(result: anytype, expected_path: []const u8) !void {
+    defer free_ok(result);
+    switch (result) {
+        .err => |err| switch (err) {
+            .validation => |v| switch (v) {
+                .option => |o| try testing.expectEqualStrings(expected_path, o.option_name),
+                .subcommand => return error.ExpectedOptionError,
+            },
+            else => return error.ExpectedValidationError,
+        },
+        .ok => return error.ExpectedError,
+    }
+}
+
+fn expect_validation_subcommand_error(result: anytype, expected_path: []const u8) !void {
+    defer free_ok(result);
+    switch (result) {
+        .err => |err| switch (err) {
+            .validation => |v| switch (v) {
+                .subcommand => |s| try testing.expectEqualStrings(expected_path, s.subcommand_name),
+                .option => return error.ExpectedSubcommandError,
+            },
+            else => return error.ExpectedValidationError,
+        },
+        .ok => return error.ExpectedError,
+    }
+}
+
+fn free_ok(result: anytype) void {
+    switch (result) {
+        .ok => |r| {
+            r.arena.deinit();
+            testing.allocator.destroy(r.arena);
+        },
+        .err => {},
+    }
+}
+
+fn test_parse_raw(app: anytype) @TypeOf(app.parse_raw(undefined, undefined, undefined)) {
+    const arena = testing.allocator.create(std.heap.ArenaAllocator) catch unreachable;
+    arena.* = std.heap.ArenaAllocator.init(testing.allocator);
+    const result = app.parse_raw(arena, &.{}, .empty);
+    switch (result) {
+        .ok => return result,
+        .err => {
+            arena.deinit();
+            testing.allocator.destroy(arena);
+            return result;
+        },
+    }
+}
 
 fn test_pascal_conversion(comptime ident: []const u8, comptime expected: []const u8) !void {
     try testing.expectEqualStrings(comptime pascal_to_kebab(ident), expected);
@@ -1685,6 +2232,19 @@ test "enum fields for subcommands" {
     }
 }
 
+test "option enum includes nested" {
+    const Root = struct {
+        Foo: struct {
+            bar: bool = false,
+        },
+        baz: i64 = 0,
+    };
+    const fields = @typeInfo(Option(Root)).@"enum".fields;
+    try testing.expectEqual(@as(usize, 2), fields.len);
+    try testing.expectEqualStrings("Foo_bar", fields[0].name);
+    try testing.expectEqualStrings("baz", fields[1].name);
+}
+
 test "pascal_to_kebab" {
     try test_pascal_conversion("", "");
     try test_pascal_conversion("Foo", "foo");
@@ -1705,18 +2265,280 @@ test "snake_to_kebab" {
     try test_snake_conversion("http11_server", "http11-server");
 }
 
+test "empty subcommand name" {
+    const Root = struct { Foo: struct {} };
+    var app = App(Root).init(.{ .name = "test" });
+    app.subcommand(.Foo, .{ .name = "" });
+    try expect_validation_subcommand_error(test_parse_raw(&app), "Root.Foo");
+}
+
+test "subcommand name conflict" {
+    const Root = struct {
+        Foo: struct {},
+        Bar: struct {},
+    };
+    var app = App(Root).init(.{ .name = "test" });
+    app.subcommand(.Foo, .{ .name = "baz" });
+    app.subcommand(.Bar, .{ .name = "baz" });
+    try expect_validation_subcommand_error(test_parse_raw(&app), "Root.Bar");
+}
+
+test "min_args with supports_positional_args false" {
+    const Root = struct { Foo: struct {} };
+    var app = App(Root).init(.{ .name = "test" });
+    app.subcommand(.Foo, .{ .supports_positional_args = false, .min_args = 1 });
+    try expect_validation_subcommand_error(test_parse_raw(&app), "Root.Foo");
+}
+
+test "max_args with supports_positional_args false" {
+    const Root = struct { Foo: struct {} };
+    var app = App(Root).init(.{ .name = "test" });
+    app.subcommand(.Foo, .{ .supports_positional_args = false, .max_args = 1 });
+    try expect_validation_subcommand_error(test_parse_raw(&app), "Root.Foo");
+}
+
+test "builtin help command conflict" {
+    const Root = struct { Help: struct {} };
+    var app = App(Root).init(.{ .name = "test", .enable_help_command = true });
+    app.subcommand(.Help, .{ .name = "help" });
+    try expect_validation_subcommand_error(test_parse_raw(&app), "Root.Help");
+}
+
+test "builtin version command conflict" {
+    const Root = struct { Version: struct {} };
+    var app = App(Root).init(.{ .name = "test", .version = "1.0" });
+    app.subcommand(.Version, .{ .name = "version" });
+    try expect_validation_subcommand_error(test_parse_raw(&app), "Root.Version");
+}
+
+test "alias conflict with existing subcommand" {
+    const Root = struct {
+        Foo: struct {},
+        Bar: struct {},
+    };
+    var app = App(Root).init(.{ .name = "test" });
+    app.subcommand(.Foo, .{ .aliases = &.{"bar"} });
+    app.subcommand(.Bar, .{});
+    try expect_validation_subcommand_error(test_parse_raw(&app), "Root.Foo");
+}
+
+test "long option conflicts with --help" {
+    const Root = struct { help_me: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.help_me, .{ .long = "help" });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.help_me");
+}
+
+test "short option conflicts with -h" {
+    const Root = struct { foo: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .short = 'h' });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "long alias conflicts with --help" {
+    const Root = struct { foo: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .long_aliases = &.{"help"} });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "long option starts with hyphen" {
+    const Root = struct { foo: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .long = "-bad" });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "long option is single character" {
+    const Root = struct { foo: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .long = "x" });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "long option contains invalid character" {
+    const Root = struct { foo: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .long = "f@o" });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "short option conflicts with existing" {
+    const Root = struct { foo: bool = false, bar: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .short = 'x' });
+    app.option(.bar, .{ .short = 'x' });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.bar");
+}
+
+test "long option conflicts with existing" {
+    const Root = struct { foo: bool = false, bar: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{});
+    app.option(.bar, .{ .long = "foo" });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.bar");
+}
+
+test "negatable only valid for bool" {
+    const Root = struct { foo: []const u8 = "x" };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .negatable = true });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "required false without default" {
+    const Root = struct { foo: i64 };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .required = false });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "option depends on itself" {
+    const Root = struct { foo: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .depends_on = &.{.foo} });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "option mutually exclusive with itself" {
+    const Root = struct { foo: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .mutually_exclusive_with = &.{.foo} });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "depends on non-inherited cross-command option" {
+    const Root = struct {
+        Foo: struct { bar: bool = false },
+        baz: bool = false,
+    };
+    var app = App(Root).init(.{ .name = "test" });
+    app.subcommand(.Foo, .{});
+    app.option(.Foo_bar, .{ .depends_on = &.{.baz} });
+    app.option(.baz, .{});
+    try expect_validation_option_error(test_parse_raw(&app), "Root.Foo.bar");
+}
+
+test "long alias empty string" {
+    const Root = struct { foo: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .long_aliases = &.{""} });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "long alias single character" {
+    const Root = struct { foo: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .long_aliases = &.{"x"} });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "long alias starts with hyphen" {
+    const Root = struct { foo: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.foo, .{ .long_aliases = &.{"-bad"} });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.foo");
+}
+
+test "inherited option shadows error" {
+    const Root = struct {
+        Foo: struct { verbose: bool = false },
+        verbose: bool = false,
+    };
+    var app = App(Root).init(.{ .name = "test" });
+    app.subcommand(.Foo, .{});
+    app.option(.Foo_verbose, .{});
+    app.option(.verbose, .{ .inherited = true });
+    try expect_validation_option_error(test_parse_raw(&app), "Root.Foo.verbose");
+}
+
+test "missing explicit subcommand definition" {
+    const Root = struct { Foo: struct {} };
+    var app = App(Root).init(.{ .name = "test" });
+    app.require_explicit_definitions();
+    try expect_missing_subcommand(test_parse_raw(&app), "Root.Foo");
+}
+
+test "missing explicit option definition" {
+    const Root = struct { foo: bool = false };
+    var app = App(Root).init(.{ .name = "test" });
+    app.require_explicit_definitions();
+    try expect_missing_option(test_parse_raw(&app), "Root.foo");
+}
+
+test "basic valid app resolves" {
+    const Root = struct {
+        Foo: struct {
+            bar: bool = false,
+        },
+        verbose: bool = false,
+    };
+    var app = App(Root).init(.{ .name = "test" });
+    app.subcommand(.Foo, .{ .summary = "do foo" });
+    app.option(.Foo_bar, .{ .short = 'b' });
+    app.option(.verbose, .{ .short = 'v', .inherited = true });
+    try expect_ok(test_parse_raw(&app));
+}
+
+test "negatable bool with default true" {
+    const Root = struct { color: bool = true };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.color, .{});
+    try expect_ok(test_parse_raw(&app));
+}
+
+test "slice option resolves" {
+    const Root = struct { tags: []const []const u8 = &.{} };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.tags, .{});
+    try expect_ok(test_parse_raw(&app));
+}
+
+test "optional field resolves" {
+    const Root = struct { port: ?u16 = null };
+    var app = App(Root).init(.{ .name = "test" });
+    app.option(.port, .{});
+    try expect_ok(test_parse_raw(&app));
+}
+
+test "subcommand aliases resolve" {
+    const Root = struct {
+        Foo: struct {},
+        Bar: struct {},
+    };
+    var app = App(Root).init(.{ .name = "test" });
+    app.subcommand(.Foo, .{ .aliases = &.{"f"} });
+    app.subcommand(.Bar, .{});
+    try expect_ok(test_parse_raw(&app));
+}
+
+test "env var prefix generates env vars" {
+    const Root = struct { foo_bar: []const u8 = "x" };
+    var app = App(Root).init(.{ .name = "test", .env_var_prefix = "MYAPP" });
+    app.option(.foo_bar, .{});
+    try expect_ok(test_parse_raw(&app));
+}
+
+test "empty string default shows quotes" {
+    const Root = struct { foo: []const u8 = "" };
+    var app = App(Root).init(.{ .name = "test", .show_defaults = true });
+    app.option(.foo, .{});
+    try expect_ok(test_parse_raw(&app));
+}
+
 const Duration = struct {
     value: i64,
-
-    pub fn cli_text2(self: Duration, allocator: Allocator) ![]const u8 {
-        _ = self;
-        return try std.fmt.allocPrint(allocator, "1h1m1s", .{});
-    }
 
     pub fn decode_cli_arg(allocator: Allocator, raw: []const u8) DecodeResult(Duration) {
         _ = allocator;
         _ = raw;
         return .{ .ok = Duration{ .value = 1 } };
+    }
+
+    pub fn format_cli(self: Duration) []const u8 {
+        _ = self;
+        return std.fmt.comptimePrint("1h1m1s", .{});
     }
 };
 
@@ -1746,6 +2568,11 @@ pub fn main(init: std.process.Init) !void {
         // .supports_positional_args = false,
         // .max_args = 1,
     });
+    app.option(.Foo_baz, .{
+        .mutually_exclusive_with = &.{.Foo_meow},
+        .depends_on = &.{.Boom_hmz},
+    });
+    app.option(.Boom_hmz, .{ .inherited = true });
     // app.option(.Foo_baz, .{ .summary = "option" });
     app.subcommand(.Foo_Bar, .{
         .summary = "Foo Bar command",
