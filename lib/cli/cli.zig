@@ -50,74 +50,14 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
     const subcommands_count = find_subcommands(RootCommand, "");
     const options_count = find_options(RootCommand, "");
 
-    const ResolvedOption = struct {
-        complete: ?Completer(RootCommand) = null,
-        decode: *const fn (Allocator, *RootCommand, DecodeSource) ?[]const u8,
-        default_text: ?[]const u8 = null,
-        depends_on: []const usize = &.{},
-        deprecated: ?[]const u8 = null,
-        dotted_path: []const u8,
-        env_var: ?[]const u8 = null,
-        group: ?OptionGroup = null,
-        hidden: bool = false,
-        id: usize,
-        inherited: bool = false,
-        is_alias: bool = false,
-        kind: ValueKind,
-        long: []const u8,
-        mutually_exclusive_with: []const usize = &.{},
-        negated: bool = false,
-        parent_command: usize = 0,
-        required: bool = false,
-        summary: ?[]const u8 = null,
-        validate: ?*const fn (Allocator, *RootCommand) ?[]const u8 = null,
-        value_label: ?[]const u8 = null,
-    };
-
-    const ResolvedCommand = struct {
-        const Self = @This();
-        action: BuiltinAction = .none,
-        aliases: []*Self = &.{},
-        complete: ?Completer(RootCommand) = null,
-        deprecated: ?[]const u8 = null,
-        description: ?[]const u8 = null,
-        dotted_path: []const u8,
-        epilog: ?[]const u8 = null,
-        group: ?SubcommandGroup = null,
-        hidden: bool = false,
-        id: usize,
-        is_alias: bool = false,
-        is_root: bool = false,
-        is_stub: bool = false,
-        long_flags: std.StringHashMapUnmanaged(*ResolvedOption) = .empty,
-        max_args: ?usize = null,
-        min_args: ?usize = null,
-        name: []const u8,
-        parent_command: usize = 0,
-        preserve_unmatched_short_options: bool = false,
-        prolog: ?[]const u8 = null,
-        short_flags: std.AutoHashMapUnmanaged(u8, *ResolvedOption) = .empty,
-        subcommands: std.StringHashMapUnmanaged(*Self) = .empty,
-        subcommands_only: bool = false,
-        summary: ?[]const u8 = null,
-        supports_positional_args: ?bool = null,
-        usage: ?Usage = null,
-    };
-
-    const Resolved = struct {
-        options: [options_count]*ResolvedOption,
-        root: *ResolvedCommand,
-        subcommands: [subcommands_count]*ResolvedCommand,
-    };
-
     const ResolvedResult = union(enum) {
-        ok: Resolved,
+        ok: Resolved(RootCommand, SubcommandGroup, OptionGroup),
         err: ValidationError,
     };
 
     const Alias = struct {
         aliases: []const []const u8,
-        subcommand: *ResolvedCommand,
+        subcommand: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup),
     };
 
     comptime var option_idx: usize = 0;
@@ -243,11 +183,22 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         }
 
         pub fn print_help_to(self: *Self, allocator: Allocator, io: std.Io, w: *std.Io.Writer, cmd: InvokedCommand(RootCommand)) !void {
-            const ctx = self.build_help_context(allocator, io, cmd);
+            var arena: std.heap.ArenaAllocator = .init(allocator);
+            const alloc = arena.allocator();
+            defer arena.deinit();
+            const resolved = switch (self.resolve_definitions(alloc)) {
+                .ok => |r| r,
+                .err => |e| {
+                    const err: ErrorResult = .{ .validation = e };
+                    print_error(alloc, io, self.app_options.name, err, self.app_options.print_error orelse default_print_error);
+                    std.process.exit(1);
+                },
+            };
+            const ctx = self.build_help_context(alloc, cmd, resolved);
             if (self.app_options.print_help) |print| {
-                try print(allocator, w, ctx);
+                try print(alloc, w, ctx);
             } else {
-                try default_print_help(allocator, w, ctx);
+                try default_print_help(alloc, w, ctx);
             }
         }
 
@@ -259,38 +210,29 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             self.subcommands[@intFromEnum(cmd)] = info;
         }
 
-        fn build_help_context(self: *Self, allocator: Allocator, io: std.Io, invoked: InvokedCommand(RootCommand)) HelpContext {
-            const resolved = switch (self.resolve_definitions(allocator)) {
-                .ok => |r| r,
-                .err => |e| {
-                    const err: ErrorResult = .{ .validation = e };
-                    print_error(allocator, io, self.app_options.name, err, self.app_options.print_error orelse default_print_error);
-                    std.process.exit(1);
-                },
-            };
+        fn build_help_context(self: *Self, allocator: Allocator, invoked: InvokedCommand(RootCommand), resolved: Resolved(RootCommand, SubcommandGroup, OptionGroup)) HelpContext {
             const id = @intFromEnum(invoked);
             const cmd = get_command(resolved, id);
 
             // Compute the command path.
             var path: std.ArrayList([]const u8) = .empty;
-            var cur: ?*ResolvedCommand = cmd;
+            var cur: ?*ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup) = cmd;
             while (cur) |c| {
-                path.append(allocator, c.name) catch oom(self.app_options.name);
                 if (c == resolved.root) {
                     break;
                 }
+                path.append(allocator, c.name) catch oom(self.app_options.name);
                 cur = get_command(resolved, c.parent_command);
             }
             std.mem.reverse([]const u8, path.items);
             const command_path = std.mem.join(allocator, " ", path.items) catch oom(self.app_options.name);
-
-            // Normalize the usage text.
-            const usage = if (cmd.usage) |cmd_usage| switch (cmd_usage) {
-                .args => |args| std.fmt.allocPrint(allocator, "{s} {s}", .{ command_path, args }) catch oom(self.app_options.name),
-                .full_text => |text| text,
-            } else null;
+            const app_name_with_subcommands = if (command_path.len > 0)
+                std.fmt.allocPrint(allocator, "{s} {s}", .{ self.app_options.name, command_path }) catch oom(self.app_options.name)
+            else
+                self.app_options.name;
 
             // Compute and group subcommands.
+            var has_subcommands = false;
             var max_subcommand_width: usize = 0;
             var ungrouped_subcmds: std.ArrayList(SubcommandHelpEntry) = .empty;
             var grouped_subcmds: std.ArrayList(GroupBucket(SubcommandHelpEntry)) = .empty;
@@ -300,6 +242,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 if (subcmd.hidden or subcmd.is_alias or subcmd.is_stub) {
                     continue;
                 }
+                has_subcommands = true;
                 const entry = SubcommandHelpEntry{
                     .deprecated = subcmd.deprecated,
                     .name = subcmd.name,
@@ -308,7 +251,8 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 max_subcommand_width = @max(max_subcommand_width, subcmd.name.len);
                 if (SubcommandGroup != void) {
                     if (subcmd.group) |group| {
-                        const name = @tagName(group);
+                        const name = allocator.dupe(u8, @tagName(group)) catch oom(self.app_options.name);
+                        std.mem.replaceScalar(u8, name, '_', ' ');
                         const order = @intFromEnum(group);
                         for (grouped_subcmds.items) |*bucket| {
                             if (std.mem.eql(u8, bucket.name, name)) {
@@ -344,7 +288,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 std.mem.sort(SubcommandHelpEntry, ungrouped_subcmds.items, {}, sort_subcmd);
                 subcommand_groups.append(allocator, .{
                     .items = ungrouped_subcmds.items,
-                    .name = "",
+                    .name = "Commands",
                 }) catch oom(self.app_options.name);
             }
             for (grouped_subcmds.items) |group| {
@@ -356,16 +300,26 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             }
 
             // Compute and group options.
+            var has_options = false;
+            var has_global_options = false;
+            var has_non_global_options = false;
             var max_option_width: usize = 0;
+            var max_value_label_width: usize = 0;
             var ungrouped_opts: std.ArrayList(OptionHelpEntry) = .empty;
             var global_opts: std.ArrayList(OptionHelpEntry) = .empty;
             var grouped_opts: std.ArrayList(GroupBucket(OptionHelpEntry)) = .empty;
+            ungrouped_opts.append(allocator, OptionHelpEntry{
+                .long = "help",
+                .short = 'h',
+                .summary = "Show help and exit",
+            }) catch oom(self.app_options.name);
             var opt_it = cmd.long_flags.valueIterator();
             while (opt_it.next()) |opt_ptr| {
                 const opt = opt_ptr.*;
                 if (opt.hidden or opt.is_alias) {
                     continue;
                 }
+                has_options = true;
                 const short = if (self.options[opt.id]) |info| info.short else null;
                 const entry = OptionHelpEntry{
                     .default_text = opt.default_text,
@@ -374,16 +328,21 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                     .required = opt.required,
                     .short = short,
                     .summary = opt.summary,
-                    .value_label = opt.value_label,
+                    .value_label = opt.value_label orelse opt.kind.value_label(allocator, self.app_options.name),
                 };
+                max_value_label_width = @max(max_value_label_width, entry.value_label.len);
                 max_option_width = @max(max_option_width, opt.long.len);
                 if (opt.inherited) {
                     global_opts.append(allocator, entry) catch oom(self.app_options.name);
+                    has_global_options = true;
                     continue;
+                } else {
+                    has_non_global_options = true;
                 }
                 if (OptionGroup != void) {
                     if (opt.group) |group| {
-                        const name = @tagName(group);
+                        const name = allocator.dupe(u8, @tagName(group)) catch oom(self.app_options.name);
+                        std.mem.replaceScalar(u8, name, '_', ' ');
                         const order = @intFromEnum(group);
                         for (grouped_opts.items) |*bucket| {
                             if (std.mem.eql(u8, bucket.name, name)) {
@@ -419,14 +378,14 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 std.mem.sort(OptionHelpEntry, ungrouped_opts.items, {}, sort_opt);
                 option_groups.append(allocator, .{
                     .items = ungrouped_opts.items,
-                    .name = "",
+                    .name = "Options",
                 }) catch oom(self.app_options.name);
             }
             if (global_opts.items.len > 0) {
                 std.mem.sort(OptionHelpEntry, global_opts.items, {}, sort_opt);
                 option_groups.append(allocator, .{
                     .items = global_opts.items,
-                    .name = "Global",
+                    .name = "Global Options",
                 }) catch oom(self.app_options.name);
             }
             for (grouped_opts.items) |group| {
@@ -437,8 +396,78 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 }) catch oom(self.app_options.name);
             }
 
+            // Normalize the usage text.
+            const commands_part: []const u8 = if (has_global_options) " [options] <command>" else " <command>";
+            const options_part: []const u8 = if (has_options) " [options]" else "";
+            var usage: ?[]const []const u8 = if (cmd.usage) |cmd_usage| switch (cmd_usage) {
+                .full_text => |text| blk: {
+                    if (text.len == 0) {
+                        break :blk null;
+                    }
+                    const lines = allocator.alloc([]const u8, 1) catch oom(self.app_options.name);
+                    lines[0] = text;
+                    break :blk lines;
+                },
+                .positional_args => |pos| blk: {
+                    if (pos.len == 0) {
+                        break :blk null;
+                    }
+                    const extra: usize = if (has_subcommands) 1 else 0;
+                    const lines = allocator.alloc([]const u8, 1 + extra) catch oom(self.app_options.name);
+                    if (has_subcommands) {
+                        lines[0] = std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, commands_part }) catch oom(self.app_options.name);
+                    }
+                    lines[0 + extra] = std.fmt.allocPrint(allocator, "{s}{s} {s}", .{ app_name_with_subcommands, options_part, pos }) catch oom(self.app_options.name);
+                    break :blk lines;
+                },
+                .positional_args_multi => |multi| blk: {
+                    if (multi.len == 0) {
+                        break :blk null;
+                    }
+                    var count: usize = 0;
+                    for (multi) |pos| {
+                        if (pos.len == 0) {
+                            continue;
+                        }
+                        count += 1;
+                    }
+                    if (count == 0) {
+                        break :blk null;
+                    }
+                    count += if (has_subcommands) 1 else 0;
+                    const lines = allocator.alloc([]const u8, count) catch oom(self.app_options.name);
+                    var idx: usize = 0;
+                    if (has_subcommands) {
+                        lines[0] = std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, commands_part }) catch oom(self.app_options.name);
+                        idx = 1;
+                    }
+                    for (multi) |pos| {
+                        if (pos.len == 0) {
+                            continue;
+                        }
+                        lines[idx] = std.fmt.allocPrint(allocator, "{s}{s} {s}", .{ app_name_with_subcommands, options_part, pos }) catch oom(self.app_options.name);
+                        idx += 1;
+                    }
+                    break :blk lines;
+                },
+            } else null;
+
+            if (usage == null) {
+                var lines_list: std.ArrayList([]const u8) = .empty;
+                if (has_subcommands) {
+                    lines_list.append(allocator, std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, commands_part }) catch oom(self.app_options.name)) catch oom(self.app_options.name);
+                }
+                if (cmd.supports_positional_args == true) {
+                    lines_list.append(allocator, std.fmt.allocPrint(allocator, "{s}{s} [args...]", .{ app_name_with_subcommands, options_part }) catch oom(self.app_options.name)) catch oom(self.app_options.name);
+                } else if (!has_subcommands or has_non_global_options) {
+                    lines_list.append(allocator, std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, options_part }) catch oom(self.app_options.name)) catch oom(self.app_options.name);
+                }
+                usage = lines_list.items;
+            }
+
             return .{
                 .app_name = self.app_options.name,
+                .app_name_with_subcommands = app_name_with_subcommands,
                 .command = .{
                     .description = cmd.description,
                     .epilog = cmd.epilog,
@@ -447,7 +476,9 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                     .usage = usage,
                 },
                 .command_path = command_path,
-                .max_option_width = max_option_width,
+                .has_options = has_options,
+                .has_subcommands = has_subcommands,
+                .max_option_width = max_option_width + max_value_label_width + 1,
                 .max_subcommand_width = max_subcommand_width,
                 .option_groups = option_groups.items,
                 .subcommand_groups = subcommand_groups.items,
@@ -470,7 +501,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             return null;
         }
 
-        fn copy_inherited_options(self: *Self, comptime field_name: []const u8, comptime fmt: []const u8, allocator: Allocator, source: *ResolvedCommand, target: *ResolvedCommand) ?ValidationError {
+        fn copy_inherited_options(self: *Self, comptime field_name: []const u8, comptime fmt: []const u8, allocator: Allocator, source: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup), target: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup)) ?ValidationError {
             var it = @field(source, field_name).iterator();
             while (it.next()) |entry| {
                 if (!entry.value_ptr.*.inherited) {
@@ -492,7 +523,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             return null;
         }
 
-        fn propagate_inherited_options(self: *Self, allocator: Allocator, cmd: *ResolvedCommand) ?ValidationError {
+        fn propagate_inherited_options(self: *Self, allocator: Allocator, cmd: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup)) ?ValidationError {
             var subcommands = cmd.subcommands.valueIterator();
             while (subcommands.next()) |subcmd_ptr| {
                 const subcmd = subcmd_ptr.*;
@@ -512,8 +543,8 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             return null;
         }
 
-        fn register_builtin_subcommand(self: *Self, allocator: Allocator, root: *ResolvedCommand, action: BuiltinAction, name: []const u8, summary: []const u8) ?ValidationError {
-            const cmd = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
+        fn register_builtin_subcommand(self: *Self, allocator: Allocator, root: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup), action: BuiltinAction, name: []const u8, summary: []const u8) ?ValidationError {
+            const cmd = allocator.create(ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup)) catch oom(self.app_options.name);
             cmd.* = .{
                 .action = action,
                 .dotted_path = name,
@@ -537,8 +568,8 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             return null;
         }
 
-        fn register_negated_option(self: *Self, allocator: Allocator, cmd: *ResolvedCommand, opt: *ResolvedOption, flag: []const u8, comptime label: []const u8) ?ValidationError {
-            const clone = allocator.create(ResolvedOption) catch oom(self.app_options.name);
+        fn register_negated_option(self: *Self, allocator: Allocator, cmd: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup), opt: *ResolvedOption(RootCommand, OptionGroup), flag: []const u8, comptime label: []const u8) ?ValidationError {
+            const clone = allocator.create(ResolvedOption(RootCommand, OptionGroup)) catch oom(self.app_options.name);
             clone.* = opt.*;
             clone.hidden = true;
             clone.long = std.fmt.allocPrint(allocator, "no-{s}", .{flag}) catch oom(self.app_options.name);
@@ -560,7 +591,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
         }
 
         fn resolve_definitions(self: *Self, allocator: Allocator) ResolvedResult {
-            const root = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
+            const root = allocator.create(ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup)) catch oom(self.app_options.name);
             root.* = .{
                 .complete = self.app_options.complete,
                 .description = self.app_options.description,
@@ -584,7 +615,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 root.prolog = self.app_options.global_prolog;
             }
             var aliased: std.ArrayList(Alias) = .empty;
-            var resolved = Resolved{
+            var resolved = Resolved(RootCommand, SubcommandGroup, OptionGroup){
                 .options = .{undefined} ** options_count,
                 .root = root,
                 .subcommands = .{undefined} ** subcommands_count,
@@ -594,7 +625,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             if (subcommands_count > 0) {
                 for (self.subcommands, self.subcommand_meta, 0..) |s, meta, i| {
                     const info = s orelse SubcommandInfo(RootCommand, SubcommandGroup){};
-                    const cmd = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
+                    const cmd = allocator.create(ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup)) catch oom(self.app_options.name);
                     cmd.* = .{
                         .complete = info.complete,
                         .deprecated = info.deprecated,
@@ -696,7 +727,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             // Resolve options.
             for (self.options, self.option_meta, 0..) |o, meta, i| {
                 const info = o orelse OptionInfo(RootCommand, OptionGroup){};
-                const opt = allocator.create(ResolvedOption) catch oom(self.app_options.name);
+                const opt = allocator.create(ResolvedOption(RootCommand, OptionGroup)) catch oom(self.app_options.name);
                 opt.* = .{
                     .complete = info.complete,
                     .decode = meta.decode,
@@ -858,7 +889,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                     if (self.validate_long_flag(allocator, cmd, alias, opt, "`long_alias` value", "")) |err| {
                         return .{ .err = err };
                     }
-                    const clone = allocator.create(ResolvedOption) catch oom(self.app_options.name);
+                    const clone = allocator.create(ResolvedOption(RootCommand, OptionGroup)) catch oom(self.app_options.name);
                     clone.* = opt.*;
                     clone.hidden = true;
                     clone.is_alias = true;
@@ -885,9 +916,9 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             // Define subcommand aliases.
             if (subcommands_count > 0) {
                 for (aliased.items) |a| {
-                    var aliases: std.ArrayList(*ResolvedCommand) = .empty;
+                    var aliases: std.ArrayList(*ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup)) = .empty;
                     for (a.aliases) |alias| {
-                        const clone = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
+                        const clone = allocator.create(ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup)) catch oom(self.app_options.name);
                         clone.* = a.subcommand.*;
                         clone.is_alias = true;
                         var parent = root;
@@ -928,7 +959,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                                 if (parent.subcommands.get(part)) |existing| {
                                     parent = existing;
                                 } else {
-                                    const child = allocator.create(ResolvedCommand) catch oom(self.app_options.name);
+                                    const child = allocator.create(ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup)) catch oom(self.app_options.name);
                                     child.* = .{
                                         .dotted_path = clone.dotted_path,
                                         .hidden = true,
@@ -986,7 +1017,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             _ = shell;
         }
 
-        fn validate_long_flag(self: *Self, allocator: Allocator, cmd: *ResolvedCommand, flag: []const u8, opt: *ResolvedOption, comptime label: []const u8, prefix: []const u8) ?ValidationError {
+        fn validate_long_flag(self: *Self, allocator: Allocator, cmd: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup), flag: []const u8, opt: *ResolvedOption(RootCommand, OptionGroup), comptime label: []const u8, prefix: []const u8) ?ValidationError {
             if (flag.len == 0) {
                 return .{
                     .option = .{
@@ -1042,7 +1073,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             return null;
         }
 
-        fn validate_option_relations(self: *Self, allocator: Allocator, resolved: Resolved, opt: *ResolvedOption, comptime relation: []const u8, related_ids: []const usize) ?ValidationError {
+        fn validate_option_relations(self: *Self, allocator: Allocator, resolved: Resolved(RootCommand, SubcommandGroup, OptionGroup), opt: *ResolvedOption(RootCommand, OptionGroup), comptime relation: []const u8, related_ids: []const usize) ?ValidationError {
             for (related_ids) |dep| {
                 if (dep == opt.id) {
                     return .{
@@ -1064,7 +1095,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                         },
                     };
                 }
-                var cmd: ?*ResolvedCommand = get_command(resolved, opt.parent_command);
+                var cmd: ?*ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup) = get_command(resolved, opt.parent_command);
                 while (cmd) |c| {
                     if (dep_opt.parent_command == c.id) {
                         break;
@@ -1083,7 +1114,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             return null;
         }
 
-        fn get_command(resolved: Resolved, id: usize) *ResolvedCommand {
+        fn get_command(resolved: Resolved(RootCommand, SubcommandGroup, OptionGroup), id: usize) *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup) {
             if (id == 0) {
                 return resolved.root;
             }
@@ -1091,7 +1122,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             return resolved.subcommands[id - 1];
         }
 
-        fn resolve_subcommands_only(cmd: *ResolvedCommand) void {
+        fn resolve_subcommands_only(cmd: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup)) void {
             if (cmd.subcommands.count() > 0) {
                 if (cmd.supports_positional_args != true) {
                     cmd.supports_positional_args = false;
@@ -1110,6 +1141,13 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
     };
 }
 
+pub const BuiltinAction = enum {
+    none,
+    completion,
+    help,
+    version,
+};
+
 pub const CommandError = struct {
     command_path: []const u8,
     kind: Kind,
@@ -1126,7 +1164,7 @@ pub const CommandHelpEntry = struct {
     epilog: ?[]const u8 = null,
     prolog: ?[]const u8 = null,
     summary: ?[]const u8 = null,
-    usage: ?[]const u8 = null,
+    usage: ?[]const []const u8 = null,
 };
 
 pub fn Completer(comptime RootCommand: type) type {
@@ -1189,8 +1227,11 @@ pub fn Group(comptime T: type) type {
 
 pub const HelpContext = struct {
     app_name: []const u8,
+    app_name_with_subcommands: []const u8,
     command: CommandHelpEntry,
     command_path: []const u8,
+    has_options: bool,
+    has_subcommands: bool,
     max_option_width: usize,
     max_subcommand_width: usize,
     option_groups: []const Group(OptionHelpEntry),
@@ -1200,11 +1241,36 @@ pub const HelpContext = struct {
 };
 
 pub const HelpStyle = struct {
-    heading: []const u8 = "\x1b[1;38;2;255;183;77m", // Plain alt: "\x1b[33;1m"
+    deprecation: []const u8 = "\x1b[1;38;2;255;100;100m",
+    deprecation_end: []const u8 = "\x1b[0m",
+    heading: []const u8 = "\x1b[1;38;2;255;175;95m",
     heading_end: []const u8 = "\x1b[0m",
-    indent_options: usize = 4,
-    indent_subcommands: usize = 4,
-    indent_usage: usize = 4,
+    highlight: []const u8 = "\x1b[1;38;2;100;200;255m",
+    highlight_end: []const u8 = "\x1b[0m",
+    indent: usize = 2,
+
+    pub const dark = HelpStyle{};
+
+    pub const light = HelpStyle{
+        .deprecation = "\x1b[1;38;2;255;100;100m",
+        .heading = "\x1b[1;38;2;180;100;20m",
+        .highlight = "\x1b[1;38;2;25;120;180m",
+    };
+
+    pub const none = HelpStyle{
+        .deprecation = "",
+        .deprecation_end = "",
+        .heading = "",
+        .heading_end = "",
+        .highlight = "",
+        .highlight_end = "",
+    };
+
+    pub const plain = HelpStyle{
+        .deprecation = "\x1b[31;1m",
+        .heading = "\x1b[32;1m",
+        .highlight = "\x1b[36;1m",
+    };
 };
 
 pub fn InvokedCommand(comptime RootCommand: type) type {
@@ -1254,7 +1320,7 @@ pub const OptionHelpEntry = struct {
     required: bool = false,
     short: ?u8 = null,
     summary: ?[]const u8 = null,
-    value_label: ?[]const u8 = null,
+    value_label: []const u8 = "",
 };
 
 pub fn OptionInfo(comptime RootCommand: type, comptime OptionGroup: type) type {
@@ -1284,6 +1350,72 @@ pub fn ParseResult(comptime RootCommand: type) type {
     return union(enum) {
         err: ErrorResult,
         ok: SuccessResult(RootCommand),
+    };
+}
+
+pub fn ResolvedOption(comptime RootCommand: type, comptime OptionGroup: type) type {
+    return struct {
+        complete: ?Completer(RootCommand) = null,
+        decode: *const fn (Allocator, *RootCommand, DecodeSource) ?[]const u8,
+        default_text: ?[]const u8 = null,
+        depends_on: []const usize = &.{},
+        deprecated: ?[]const u8 = null,
+        dotted_path: []const u8,
+        env_var: ?[]const u8 = null,
+        group: ?OptionGroup = null,
+        hidden: bool = false,
+        id: usize,
+        inherited: bool = false,
+        is_alias: bool = false,
+        kind: ValueKind,
+        long: []const u8,
+        mutually_exclusive_with: []const usize = &.{},
+        negated: bool = false,
+        parent_command: usize = 0,
+        required: bool = false,
+        summary: ?[]const u8 = null,
+        validate: ?*const fn (Allocator, *RootCommand) ?[]const u8 = null,
+        value_label: ?[]const u8 = null,
+    };
+}
+
+pub fn ResolvedCommand(comptime RootCommand: type, comptime SubcommandGroup: type, comptime OptionGroup: type) type {
+    return struct {
+        const Self = @This();
+        action: BuiltinAction = .none,
+        aliases: []*Self = &.{},
+        complete: ?Completer(RootCommand) = null,
+        deprecated: ?[]const u8 = null,
+        description: ?[]const u8 = null,
+        dotted_path: []const u8,
+        epilog: ?[]const u8 = null,
+        group: ?SubcommandGroup = null,
+        hidden: bool = false,
+        id: usize,
+        is_alias: bool = false,
+        is_root: bool = false,
+        is_stub: bool = false,
+        long_flags: std.StringHashMapUnmanaged(*ResolvedOption(RootCommand, OptionGroup)) = .empty,
+        max_args: ?usize = null,
+        min_args: ?usize = null,
+        name: []const u8,
+        parent_command: usize = 0,
+        preserve_unmatched_short_options: bool = false,
+        prolog: ?[]const u8 = null,
+        short_flags: std.AutoHashMapUnmanaged(u8, *ResolvedOption(RootCommand, OptionGroup)) = .empty,
+        subcommands: std.StringHashMapUnmanaged(*Self) = .empty,
+        subcommands_only: bool = false,
+        summary: ?[]const u8 = null,
+        supports_positional_args: ?bool = null,
+        usage: ?Usage = null,
+    };
+}
+
+pub fn Resolved(comptime RootCommand: type, comptime SubcommandGroup: type, comptime OptionGroup: type) type {
+    return struct {
+        options: [find_options(RootCommand, "")]*ResolvedOption(RootCommand, OptionGroup),
+        root: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup),
+        subcommands: [find_subcommands(RootCommand, "")]*ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup),
     };
 }
 
@@ -1340,8 +1472,9 @@ pub fn SuccessResult(comptime RootCommand: type) type {
 }
 
 pub const Usage = union(enum) {
-    args: []const u8,
     full_text: []const u8,
+    positional_args: []const u8,
+    positional_args_multi: []const []const u8,
 };
 
 pub const ValidationError = union(enum) {
@@ -1356,16 +1489,9 @@ pub const ValidationError = union(enum) {
 };
 
 pub const WrapSpec = struct {
-    indent: u32 = 0,
-    start_col: u32 = 0,
-    width: u32 = 80,
-};
-
-const BuiltinAction = enum {
-    none,
-    completion,
-    help,
-    version,
+    indent: usize = 0,
+    start_col: usize = 0,
+    width: usize = 80,
 };
 
 fn GroupBucket(comptime T: type) type {
@@ -1528,9 +1654,34 @@ const ValueKind = union(enum) {
             else => @compileError(err ++ "must return []const u8, not " ++ @typeName(Return)),
         }
     }
+
+    fn value_label(self: ValueKind, allocator: Allocator, app_name: []const u8) []const u8 {
+        return switch (self) {
+            .bool => "",
+            .float => "float",
+            .int => "int",
+            .interface => "value",
+            .optional => |inner| {
+                const repr = inner.value_label(allocator, app_name);
+                if (repr.len > 0) {
+                    return std.fmt.allocPrint(allocator, "?{s}", .{repr}) catch oom(app_name);
+                }
+                return "";
+            },
+            .slice => |inner| {
+                const repr = inner.value_label(allocator, app_name);
+                if (repr.len > 0) {
+                    return std.fmt.allocPrint(allocator, "[]{s}", .{repr}) catch oom(app_name);
+                }
+                return "[]bool";
+            },
+            .string => "string",
+            .string_enum => "enum",
+        };
+    }
 };
 
-pub fn write_wrapped(writer: *std.Io.Writer, text: []const u8, spec: WrapSpec) !void {
+pub fn write_wrapped(writer: *std.Io.Writer, text: []const u8, spec: WrapSpec) !usize {
     var col = spec.start_col;
     if (col < spec.indent) {
         _ = try writer.splatByte(' ', spec.indent - col);
@@ -1555,19 +1706,20 @@ pub fn write_wrapped(writer: *std.Io.Writer, text: []const u8, spec: WrapSpec) !
         }
         if (first) {
             try writer.writeAll(word);
-            col += @intCast(word.len);
+            col += word.len;
             first = false;
-        } else if (col + 1 + @as(u32, @intCast(word.len)) > spec.width) {
+        } else if ((col + 1 + word.len) > spec.width) {
             try writer.writeByte('\n');
             _ = try writer.splatByte(' ', spec.indent);
             try writer.writeAll(word);
-            col = spec.indent + @as(u32, @intCast(word.len));
+            col = spec.indent + word.len;
         } else {
             try writer.writeByte(' ');
             try writer.writeAll(word);
-            col += 1 + @as(u32, @intCast(word.len));
+            col += 1 + word.len;
         }
     }
+    return col;
 }
 
 fn construct_decode(comptime RootCommand: type, comptime T: type, comptime kind: ValueKind, comptime path: []const []const u8) *const fn (Allocator, *RootCommand, DecodeSource) ?[]const u8 {
@@ -1858,10 +2010,140 @@ fn default_print_error(allocator: Allocator, w: *std.Io.Writer, app_name: []cons
 }
 
 fn default_print_help(allocator: Allocator, w: *std.Io.Writer, ctx: HelpContext) !void {
-    _ = allocator;
     const heading = ctx.style.heading;
     const heading_end = ctx.style.heading_end;
-    try w.print("{s}USAGE{s}\n", .{ heading, heading_end });
+    const highlight = ctx.style.highlight;
+    const highlight_end = ctx.style.highlight_end;
+    const spec: WrapSpec = .{
+        .indent = ctx.style.indent,
+        .start_col = 0,
+        .width = ctx.terminal_width,
+    };
+    var printed = false;
+    if (ctx.command.prolog) |prolog| {
+        try w.print("{s}\n", .{prolog});
+        printed = true;
+    }
+    if (ctx.command.summary) |summary| {
+        if (printed) {
+            try w.print("\n", .{});
+        }
+        try w.print("{s}\n", .{summary});
+        printed = true;
+    }
+    if (ctx.command.usage) |usage| {
+        if (printed) {
+            try w.print("\n", .{});
+        }
+        try w.print("{s}Usage:{s} {s}", .{ heading, heading_end, highlight });
+        for (usage, 0..) |line, i| {
+            if (i == 0) {
+                _ = try write_wrapped(w, line, .{ .indent = 7, .start_col = 7, .width = spec.width });
+                try w.print("\n", .{});
+            } else {
+                _ = try write_wrapped(w, line, .{ .indent = 7, .start_col = 0, .width = spec.width });
+                try w.print("\n", .{});
+            }
+        }
+        try w.print("{s}", .{highlight_end});
+        printed = true;
+    }
+    if (ctx.command.description) |description| {
+        if (printed) {
+            try w.print("\n", .{});
+        }
+        try w.print("{s}Info:{s}\n", .{ heading, heading_end });
+        _ = try write_wrapped(w, description, spec);
+        try w.print("\n", .{});
+        printed = true;
+    }
+    const opt_indent = spec.indent + 4 + 2 + ctx.max_option_width + 3;
+    for (ctx.option_groups) |group| {
+        if (group.items.len > 0) {
+            if (printed) {
+                try w.print("\n", .{});
+            }
+            const name = if (group.name.len > 0) group.name else "Options";
+            try w.print("{s}{s}:{s}\n", .{ heading, name, heading_end });
+            for (group.items) |opt| {
+                _ = try w.splatByte(' ', spec.indent);
+                if (opt.short) |short| {
+                    try w.print("{s}-{c}{s}, ", .{ highlight, short, highlight_end });
+                } else {
+                    try w.print("    ", .{});
+                }
+                try w.print("{s}--{s} {s}{s}", .{ highlight, opt.long, opt.value_label, highlight_end });
+                const start: usize = spec.indent + 4 + 2 + opt.long.len + 1 + opt.value_label.len;
+                var col: usize = start;
+                if (opt.summary) |summary| {
+                    if (summary.len > 0) {
+                        col = try write_wrapped(w, summary, .{ .indent = opt_indent, .start_col = start, .width = spec.width });
+                    }
+                }
+                if (opt.default_text) |default_text| {
+                    if (col > opt_indent) {
+                        try w.print(" ", .{});
+                    }
+                    col = try write_wrapped(
+                        w,
+                        std.fmt.allocPrint(allocator, "(default: {s})", .{default_text}) catch oom(ctx.app_name),
+                        .{ .indent = opt_indent, .start_col = col, .width = spec.width },
+                    );
+                }
+                if (opt.deprecated) |deprecated| {
+                    if (deprecated.len > 0) {
+                        try w.print("{s}", .{ctx.style.deprecation});
+                        if (col > opt_indent) {
+                            try w.print(" ", .{});
+                        }
+                        col = try write_wrapped(
+                            w,
+                            std.fmt.allocPrint(allocator, "DEPRECATED: {s}", .{deprecated}) catch oom(ctx.app_name),
+                            .{ .indent = opt_indent, .start_col = col, .width = spec.width },
+                        );
+                        try w.print("{s}", .{ctx.style.deprecation_end});
+                    }
+                }
+                try w.print("\n", .{});
+            }
+            printed = true;
+        }
+    }
+    const command_indent = spec.indent + ctx.max_subcommand_width + 3;
+    for (ctx.subcommand_groups) |group| {
+        if (group.items.len > 0) {
+            if (printed) {
+                try w.print("\n", .{});
+            }
+            const name = if (group.name.len > 0) group.name else "Commands";
+            try w.print("{s}{s}:{s}\n", .{ heading, name, heading_end });
+            for (group.items) |subcommand| {
+                try w.print("{s}", .{highlight});
+                _ = try write_wrapped(w, subcommand.name, spec);
+                try w.print("{s}", .{highlight_end});
+                if (subcommand.summary) |summary| {
+                    const start = spec.indent + subcommand.name.len;
+                    _ = try write_wrapped(w, summary, .{ .indent = command_indent, .start_col = start, .width = spec.width });
+                }
+                try w.print("\n", .{});
+            }
+            printed = true;
+        }
+    }
+    if (ctx.has_subcommands) {
+        if (ctx.command_path.len > 0) {
+            try w.print("\nSee '{s}{s} help {s} <command>{s}' for more information on a specific command.\n", .{ highlight, ctx.app_name, ctx.command_path, highlight_end });
+        } else {
+            try w.print("\nSee '{s}{s} help <command>{s}' for more information on a specific command.\n", .{ highlight, ctx.app_name, highlight_end });
+        }
+    }
+    if (ctx.command.epilog) |epilog| {
+        if (printed) {
+            try w.print("\n", .{});
+        }
+        try w.print("{s}\n", .{epilog});
+        printed = true;
+    }
     try w.flush();
 }
 
@@ -2554,24 +2836,48 @@ const MyApp = struct {
         hmz: i64,
     },
     spam: bool,
+    host: []const u8,
+    duration: f64,
+    timeout: Duration,
+};
+
+const MySubcommandGroup = enum {
+    Server_Commands,
+};
+
+const MyOptionGroup = enum {
+    Deploy_Options,
 };
 
 pub fn main(init: std.process.Init) !void {
-    var app = App(MyApp).init(.{
+    var app = AppWithGroups(
+        MyApp,
+        MySubcommandGroup,
+        MyOptionGroup,
+    ).init(.{
         .name = "kickass",
         .show_defaults = true,
+        .global_epilog = "This is an epilog",
+        .global_prolog = "This is a prolog",
+        .description = "This is a description",
+        .summary = "This is a summary",
+        .usage = .{ .positional_args = "<input>" },
+        .help_style = .plain,
     });
 
     app.subcommand(.Foo, .{
         .summary = "Foo command",
         .name = "fx",
+        .group = .Server_Commands,
         // .supports_positional_args = false,
         // .max_args = 1,
     });
     app.option(.Foo_baz, .{
-        .mutually_exclusive_with = &.{.Foo_meow},
-        .depends_on = &.{.Boom_hmz},
+        .deprecated = "Use --foo instead",
+        // .mutually_exclusive_with = &.{.Foo_meow},
+        // .depends_on = &.{.Boom_hmz},
     });
+    app.option(.host, .{ .group = .Deploy_Options });
     app.option(.Boom_hmz, .{ .inherited = true });
     // app.option(.Foo_baz, .{ .summary = "option" });
     app.subcommand(.Foo_Bar, .{
@@ -2592,6 +2898,7 @@ pub fn main(init: std.process.Init) !void {
     var result = app.parse(init);
     defer result.deinit();
 
+    // try app.print_help(init.gpa, init.io, .Default);
     try app.print_help(init.gpa, init.io, .Foo);
 
     switch (result.invoked_command) {
