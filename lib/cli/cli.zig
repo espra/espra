@@ -18,7 +18,7 @@ pub fn AppOptions(comptime RootCommand: type) type {
         complete: ?Completer(RootCommand) = null,
         description: ?[]const u8 = null,
         enable_completion_command: bool = false,
-        enable_help_command: bool = false,
+        enable_help_command: bool = true,
         env_var_prefix: ?[]const u8 = null,
         epilog: ?[]const u8 = null,
         global_epilog: ?[]const u8 = null,
@@ -30,7 +30,6 @@ pub fn AppOptions(comptime RootCommand: type) type {
         max_args: ?usize = null,
         min_args: ?usize = null,
         name: []const u8,
-        preserve_unmatched_short_options: bool = false,
         prolog: ?[]const u8 = null,
         show_defaults: ?bool = null,
         supports_positional_args: ?bool = null,
@@ -112,7 +111,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             self.options[@intFromEnum(opt)] = info;
         }
 
-        pub fn parse(self: *Self, proc: std.process.Init) SuccessResult(RootCommand) {
+        pub fn parse(self: *Self, proc: std.process.Init) SuccessResult(RootCommand, SubcommandGroup, OptionGroup) {
             const arena = proc.gpa.create(std.heap.ArenaAllocator) catch oom(self.app_options.name);
             arena.* = std.heap.ArenaAllocator.init(proc.gpa);
             const allocator = arena.allocator();
@@ -121,7 +120,26 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             const result = self.parse_raw(arena, args, proc.minimal.environ);
             switch (result) {
                 .ok => |r| {
-                    if (r.deprecations) |deprecations| {
+                    switch (r._internal.action) {
+                        .completion => |shell| {
+                            self.run_completion(shell);
+                            std.process.exit(0);
+                        },
+                        .help => {
+                            self.print_help(allocator, proc.io, r.invoked_command) catch oom(self.app_options.name);
+                            std.process.exit(0);
+                        },
+                        .none => {},
+                        .version => {
+                            var buf: [64]u8 = undefined;
+                            var stdout = std.Io.File.stdout().writer(proc.io, &buf);
+                            const w = &stdout.interface;
+                            w.print("{s}\n", .{self.app_options.version.?}) catch oom(self.app_options.name);
+                            w.flush() catch {};
+                            std.process.exit(0);
+                        },
+                    }
+                    if (r._internal.deprecations) |deprecations| {
                         print_deprecations(allocator, proc.io, self.app_options.name, deprecations, self.app_options.print_deprecations orelse default_print_deprecations);
                     }
                     return r;
@@ -133,17 +151,8 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             }
         }
 
-        pub fn parse_raw(self: *Self, arena: *std.heap.ArenaAllocator, args: []const []const u8, env: std.process.Environ) ParseResult(RootCommand) {
+        pub fn parse_raw(self: *Self, arena: *std.heap.ArenaAllocator, args: []const []const u8, env: std.process.Environ) ParseResult(RootCommand, SubcommandGroup, OptionGroup) {
             const allocator = arena.allocator();
-            const autocomplete = env.getAlloc(allocator, "CLI_AUTOCOMPLETE") catch |err| switch (err) {
-                error.EnvironmentVariableMissing => null,
-                error.InvalidWtf8 => exit_error(self.app_options.name, "invalid WTF-8 environment variable"),
-                error.OutOfMemory => oom(self.app_options.name),
-            };
-            if (autocomplete) |shell| {
-                self.run_completion(shell);
-                std.process.exit(0);
-            }
             if (self.require_explicit) {
                 if (self.check_explicit_definitions()) |err| {
                     return .{
@@ -159,18 +168,87 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                     };
                 },
             };
-            _ = resolved;
-            _ = args;
+
+            const autocomplete = env.getAlloc(allocator, "CLI_AUTOCOMPLETE") catch |err| switch (err) {
+                error.EnvironmentVariableMissing => null,
+                error.InvalidWtf8 => exit_error(self.app_options.name, "invalid WTF-8 environment variable"),
+                error.OutOfMemory => oom(self.app_options.name),
+            };
+            if (autocomplete) |shell| {
+                return .{
+                    .ok = .{
+                        ._internal = .{
+                            .action = .{
+                                .completion = shell,
+                            },
+                            .arena = arena,
+                            .resolved = resolved,
+                        },
+                    },
+                };
+            }
+
             const root = allocator.create(RootCommand) catch oom(self.app_options.name);
             root.* = std.mem.zeroInit(RootCommand, .{});
+
+            // var action: BuiltinAction = .none;
+            var cmd: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup) = resolved.root;
+            var deprecations: std.ArrayList(Deprecation) = .empty;
+            var flags_done = false;
+            var idx: usize = 0;
+            var positional_args: std.ArrayList([]const u8) = .empty;
+
+            while (idx < args.len) : (idx += 1) {
+                const arg = args[idx];
+                if (flags_done) {
+                    positional_args.append(allocator, arg) catch oom(self.app_options.name);
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--")) {
+                    flags_done = true;
+                    continue;
+                }
+            }
+
+            if (cmd.min_args) |min| {
+                if (positional_args.items.len < min) {
+                    const usage_text = get_usage_lines(allocator, self.app_options.name, app_name_with_subcommands, cmd, has_subcommands, has_options, has_global_options, has_non_global_options);
+                    return .{
+                        .err = .{
+                            .command = .{
+                                .command_path = cmd_path,
+                                .kind = .{ .too_few_args = .{ .min_args = min, .usage = usage_text } },
+                            },
+                        },
+                    };
+                }
+            }
+
+            if (cmd.max_args) |min| {
+                if (positional_args.items.len > max) {
+                    const usage_text = get_usage_lines(allocator, self.app_options.name, app_name_with_subcommands, cmd, has_subcommands, has_options, has_global_options, has_non_global_options);
+                    return .{
+                        .err = .{
+                            .command = .{
+                                .command_path = cmd_path,
+                                .kind = .{ .too_many_args = .{ .max_args = max, .usage = usage_text } },
+                            },
+                        },
+                    };
+                }
+            }
+
             return .{
                 .ok = .{
-                    .arena = arena,
-                    .args = &.{},
-                    .deprecations = null,
-                    .invoked_command = .Default,
+                    ._internal = .{
+                        .action = .none,
+                        .arena = arena,
+                        .deprecations = if (deprecations.items.len > 0) deprecations.items else null,
+                        .resolved = resolved,
+                    },
+                    .args = positional_args.items,
+                    .invoked_command = @enumFromInt(cmd.id),
                     .root = root,
-                    .unmatched_short_options = null,
                 },
             };
         }
@@ -225,6 +303,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 cur = get_command(resolved, c.parent_command);
             }
             std.mem.reverse([]const u8, path.items);
+
             const command_path = std.mem.join(allocator, " ", path.items) catch oom(self.app_options.name);
             const app_name_with_subcommands = if (command_path.len > 0)
                 std.fmt.allocPrint(allocator, "{s} {s}", .{ self.app_options.name, command_path }) catch oom(self.app_options.name)
@@ -236,6 +315,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             var max_subcommand_width: usize = 0;
             var ungrouped_subcmds: std.ArrayList(SubcommandHelpEntry) = .empty;
             var grouped_subcmds: std.ArrayList(GroupBucket(SubcommandHelpEntry)) = .empty;
+
             var subcmd_it = cmd.subcommands.valueIterator();
             while (subcmd_it.next()) |subcmd_ptr| {
                 const subcmd = subcmd_ptr.*;
@@ -273,16 +353,19 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 }
                 ungrouped_subcmds.append(allocator, entry) catch oom(self.app_options.name);
             }
+
             std.mem.sort(GroupBucket(SubcommandHelpEntry), grouped_subcmds.items, {}, struct {
                 fn lt(_: void, a: GroupBucket(SubcommandHelpEntry), b: GroupBucket(SubcommandHelpEntry)) bool {
                     return a.order < b.order;
                 }
             }.lt);
+
             const sort_subcmd = struct {
                 fn lt(_: void, a: SubcommandHelpEntry, b: SubcommandHelpEntry) bool {
                     return std.mem.order(u8, a.name, b.name) == .lt;
                 }
             }.lt;
+
             var subcommand_groups: std.ArrayList(Group(SubcommandHelpEntry)) = .empty;
             if (ungrouped_subcmds.items.len > 0) {
                 std.mem.sort(SubcommandHelpEntry, ungrouped_subcmds.items, {}, sort_subcmd);
@@ -308,11 +391,13 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             var ungrouped_opts: std.ArrayList(OptionHelpEntry) = .empty;
             var global_opts: std.ArrayList(OptionHelpEntry) = .empty;
             var grouped_opts: std.ArrayList(GroupBucket(OptionHelpEntry)) = .empty;
+
             ungrouped_opts.append(allocator, OptionHelpEntry{
                 .long = "help",
                 .short = 'h',
                 .summary = "Show help and exit",
             }) catch oom(self.app_options.name);
+
             var opt_it = cmd.long_flags.valueIterator();
             while (opt_it.next()) |opt_ptr| {
                 const opt = opt_ptr.*;
@@ -363,16 +448,19 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 }
                 ungrouped_opts.append(allocator, entry) catch oom(self.app_options.name);
             }
+
             std.mem.sort(GroupBucket(OptionHelpEntry), grouped_opts.items, {}, struct {
                 fn lt(_: void, a: GroupBucket(OptionHelpEntry), b: GroupBucket(OptionHelpEntry)) bool {
                     return a.order < b.order;
                 }
             }.lt);
+
             const sort_opt = struct {
                 fn lt(_: void, a: OptionHelpEntry, b: OptionHelpEntry) bool {
                     return std.mem.order(u8, a.long, b.long) == .lt;
                 }
             }.lt;
+
             var option_groups: std.ArrayList(Group(OptionHelpEntry)) = .empty;
             if (ungrouped_opts.items.len > 0) {
                 std.mem.sort(OptionHelpEntry, ungrouped_opts.items, {}, sort_opt);
@@ -396,75 +484,6 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 }) catch oom(self.app_options.name);
             }
 
-            // Normalize the usage text.
-            const commands_part: []const u8 = if (has_global_options) " [options] <command>" else " <command>";
-            const options_part: []const u8 = if (has_options) " [options]" else "";
-            var usage: ?[]const []const u8 = if (cmd.usage) |cmd_usage| switch (cmd_usage) {
-                .full_text => |text| blk: {
-                    if (text.len == 0) {
-                        break :blk null;
-                    }
-                    const lines = allocator.alloc([]const u8, 1) catch oom(self.app_options.name);
-                    lines[0] = text;
-                    break :blk lines;
-                },
-                .positional_args => |pos| blk: {
-                    if (pos.len == 0) {
-                        break :blk null;
-                    }
-                    const extra: usize = if (has_subcommands) 1 else 0;
-                    const lines = allocator.alloc([]const u8, 1 + extra) catch oom(self.app_options.name);
-                    if (has_subcommands) {
-                        lines[0] = std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, commands_part }) catch oom(self.app_options.name);
-                    }
-                    lines[0 + extra] = std.fmt.allocPrint(allocator, "{s}{s} {s}", .{ app_name_with_subcommands, options_part, pos }) catch oom(self.app_options.name);
-                    break :blk lines;
-                },
-                .positional_args_multi => |multi| blk: {
-                    if (multi.len == 0) {
-                        break :blk null;
-                    }
-                    var count: usize = 0;
-                    for (multi) |pos| {
-                        if (pos.len == 0) {
-                            continue;
-                        }
-                        count += 1;
-                    }
-                    if (count == 0) {
-                        break :blk null;
-                    }
-                    count += if (has_subcommands) 1 else 0;
-                    const lines = allocator.alloc([]const u8, count) catch oom(self.app_options.name);
-                    var idx: usize = 0;
-                    if (has_subcommands) {
-                        lines[0] = std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, commands_part }) catch oom(self.app_options.name);
-                        idx = 1;
-                    }
-                    for (multi) |pos| {
-                        if (pos.len == 0) {
-                            continue;
-                        }
-                        lines[idx] = std.fmt.allocPrint(allocator, "{s}{s} {s}", .{ app_name_with_subcommands, options_part, pos }) catch oom(self.app_options.name);
-                        idx += 1;
-                    }
-                    break :blk lines;
-                },
-            } else null;
-
-            if (usage == null) {
-                var lines_list: std.ArrayList([]const u8) = .empty;
-                if (has_subcommands) {
-                    lines_list.append(allocator, std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, commands_part }) catch oom(self.app_options.name)) catch oom(self.app_options.name);
-                }
-                if (cmd.supports_positional_args == true) {
-                    lines_list.append(allocator, std.fmt.allocPrint(allocator, "{s}{s} [args...]", .{ app_name_with_subcommands, options_part }) catch oom(self.app_options.name)) catch oom(self.app_options.name);
-                } else if (!has_subcommands or has_non_global_options) {
-                    lines_list.append(allocator, std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, options_part }) catch oom(self.app_options.name)) catch oom(self.app_options.name);
-                }
-                usage = lines_list.items;
-            }
-
             return .{
                 .app_name = self.app_options.name,
                 .app_name_with_subcommands = app_name_with_subcommands,
@@ -473,9 +492,10 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                     .epilog = cmd.epilog,
                     .prolog = cmd.prolog,
                     .summary = cmd.summary,
-                    .usage = usage,
+                    .usage = get_usage_lines(allocator, self.app_options.name, app_name_with_subcommands, cmd, has_subcommands, has_options, has_global_options, has_non_global_options),
                 },
                 .command_path = command_path,
+                .has_help_command = self.app_options.enable_help_command,
                 .has_options = has_options,
                 .has_subcommands = has_subcommands,
                 .max_option_width = max_option_width + max_value_label_width + 1,
@@ -550,7 +570,6 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 .dotted_path = name,
                 .epilog = self.app_options.global_epilog,
                 .id = 0,
-                .is_stub = true,
                 .name = name,
                 .prolog = self.app_options.global_prolog,
                 .summary = summary,
@@ -602,7 +621,6 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                 .max_args = self.app_options.max_args,
                 .min_args = self.app_options.min_args,
                 .name = self.app_options.name,
-                .preserve_unmatched_short_options = self.app_options.preserve_unmatched_short_options,
                 .prolog = self.app_options.prolog,
                 .summary = self.app_options.summary,
                 .supports_positional_args = self.app_options.supports_positional_args,
@@ -639,7 +657,6 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
                         .min_args = info.min_args,
                         .name = info.name orelse meta.name,
                         .parent_command = meta.parent_command,
-                        .preserve_unmatched_short_options = info.preserve_unmatched_short_options,
                         .prolog = info.prolog,
                         .summary = info.summary,
                         .supports_positional_args = info.supports_positional_args,
@@ -990,7 +1007,7 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
 
             // Define built-in subcommands.
             if (self.app_options.enable_completion_command) {
-                if (self.register_builtin_subcommand(allocator, root, .completion, "completion", "Generate shell completion script")) |err| {
+                if (self.register_builtin_subcommand(allocator, root, .{ .completion = "" }, "completion", "Generate shell completion script")) |err| {
                     return .{ .err = err };
                 }
             }
@@ -1122,6 +1139,77 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
             return resolved.subcommands[id - 1];
         }
 
+        fn get_usage_lines(allocator: Allocator, app_name: []const u8, app_name_with_subcommands: []const u8, cmd: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup), has_subcommands: bool, has_options: bool, has_global_options: bool, has_non_global_options: bool) ?[]const []const u8 {
+            const commands_part: []const u8 = if (has_global_options) " [options] <command>" else " <command>";
+            const options_part: []const u8 = if (has_options) " [options]" else "";
+            var usage: ?[]const []const u8 = if (cmd.usage) |cmd_usage| switch (cmd_usage) {
+                .full_text => |text| blk: {
+                    if (text.len == 0) {
+                        break :blk null;
+                    }
+                    const lines = allocator.alloc([]const u8, 1) catch oom(app_name);
+                    lines[0] = text;
+                    break :blk lines;
+                },
+                .positional_args => |pos| blk: {
+                    if (pos.len == 0) {
+                        break :blk null;
+                    }
+                    const extra: usize = if (has_subcommands) 1 else 0;
+                    const lines = allocator.alloc([]const u8, 1 + extra) catch oom(app_name);
+                    if (has_subcommands) {
+                        lines[0] = std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, commands_part }) catch oom(app_name);
+                    }
+                    lines[0 + extra] = std.fmt.allocPrint(allocator, "{s}{s} {s}", .{ app_name_with_subcommands, options_part, pos }) catch oom(app_name);
+                    break :blk lines;
+                },
+                .positional_args_multi => |multi| blk: {
+                    if (multi.len == 0) {
+                        break :blk null;
+                    }
+                    var count: usize = 0;
+                    for (multi) |pos| {
+                        if (pos.len == 0) {
+                            continue;
+                        }
+                        count += 1;
+                    }
+                    if (count == 0) {
+                        break :blk null;
+                    }
+                    count += if (has_subcommands) 1 else 0;
+                    const lines = allocator.alloc([]const u8, count) catch oom(app_name);
+                    var idx: usize = 0;
+                    if (has_subcommands) {
+                        lines[0] = std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, commands_part }) catch oom(app_name);
+                        idx = 1;
+                    }
+                    for (multi) |pos| {
+                        if (pos.len == 0) {
+                            continue;
+                        }
+                        lines[idx] = std.fmt.allocPrint(allocator, "{s}{s} {s}", .{ app_name_with_subcommands, options_part, pos }) catch oom(app_name);
+                        idx += 1;
+                    }
+                    break :blk lines;
+                },
+            } else null;
+
+            if (usage == null) {
+                var lines_list: std.ArrayList([]const u8) = .empty;
+                if (has_subcommands) {
+                    lines_list.append(allocator, std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, commands_part }) catch oom(app_name)) catch oom(app_name);
+                }
+                if (cmd.supports_positional_args == true) {
+                    lines_list.append(allocator, std.fmt.allocPrint(allocator, "{s}{s} [args...]", .{ app_name_with_subcommands, options_part }) catch oom(app_name)) catch oom(app_name);
+                } else if (!has_subcommands or has_non_global_options) {
+                    lines_list.append(allocator, std.fmt.allocPrint(allocator, "{s}{s}", .{ app_name_with_subcommands, options_part }) catch oom(app_name)) catch oom(app_name);
+                }
+                usage = lines_list.items;
+            }
+            return usage;
+        }
+
         fn resolve_subcommands_only(cmd: *ResolvedCommand(RootCommand, SubcommandGroup, OptionGroup)) void {
             if (cmd.subcommands.count() > 0) {
                 if (cmd.supports_positional_args != true) {
@@ -1141,9 +1229,9 @@ pub fn AppWithGroups(comptime RootCommand: type, comptime SubcommandGroup: type,
     };
 }
 
-pub const BuiltinAction = enum {
+pub const BuiltinAction = union(enum) {
     none,
-    completion,
+    completion: []const u8,
     help,
     version,
 };
@@ -1230,6 +1318,7 @@ pub const HelpContext = struct {
     app_name_with_subcommands: []const u8,
     command: CommandHelpEntry,
     command_path: []const u8,
+    has_help_command: bool,
     has_options: bool,
     has_subcommands: bool,
     max_option_width: usize,
@@ -1241,20 +1330,20 @@ pub const HelpContext = struct {
 };
 
 pub const HelpStyle = struct {
-    deprecation: []const u8 = "\x1b[1;38;2;255;100;100m",
+    deprecation: []const u8 = "\x1b[1;38;2;255;160;160m",
     deprecation_end: []const u8 = "\x1b[0m",
-    heading: []const u8 = "\x1b[1;38;2;255;175;95m",
+    heading: []const u8 = "\x1b[1;38;2;200;170;255m",
     heading_end: []const u8 = "\x1b[0m",
-    highlight: []const u8 = "\x1b[1;38;2;100;200;255m",
+    highlight: []const u8 = "\x1b[1;38;2;255;180;80m",
     highlight_end: []const u8 = "\x1b[0m",
     indent: usize = 2,
 
     pub const dark = HelpStyle{};
 
     pub const light = HelpStyle{
-        .deprecation = "\x1b[1;38;2;255;100;100m",
-        .heading = "\x1b[1;38;2;180;100;20m",
-        .highlight = "\x1b[1;38;2;25;120;180m",
+        .deprecation = "\x1b[1;38;2;180;50;50m",
+        .heading = "\x1b[1;38;2;100;60;180m",
+        .highlight = "\x1b[1;38;2;180;100;20m",
     };
 
     pub const none = HelpStyle{
@@ -1346,10 +1435,10 @@ pub fn OptionInfo(comptime RootCommand: type, comptime OptionGroup: type) type {
     };
 }
 
-pub fn ParseResult(comptime RootCommand: type) type {
+pub fn ParseResult(comptime RootCommand: type, comptime SubcommandGroup: type, comptime OptionGroup: type) type {
     return union(enum) {
         err: ErrorResult,
-        ok: SuccessResult(RootCommand),
+        ok: SuccessResult(RootCommand, SubcommandGroup, OptionGroup),
     };
 }
 
@@ -1400,7 +1489,6 @@ pub fn ResolvedCommand(comptime RootCommand: type, comptime SubcommandGroup: typ
         min_args: ?usize = null,
         name: []const u8,
         parent_command: usize = 0,
-        preserve_unmatched_short_options: bool = false,
         prolog: ?[]const u8 = null,
         short_flags: std.AutoHashMapUnmanaged(u8, *ResolvedOption(RootCommand, OptionGroup)) = .empty,
         subcommands: std.StringHashMapUnmanaged(*Self) = .empty,
@@ -1446,7 +1534,6 @@ pub fn SubcommandInfo(comptime RootCommand: type, comptime SubcommandGroup: type
         max_args: ?usize = null,
         min_args: ?usize = null,
         name: ?[]const u8 = null,
-        preserve_unmatched_short_options: bool = false,
         prolog: ?[]const u8 = null,
         summary: ?[]const u8 = null,
         supports_positional_args: ?bool = null,
@@ -1454,19 +1541,22 @@ pub fn SubcommandInfo(comptime RootCommand: type, comptime SubcommandGroup: type
     };
 }
 
-pub fn SuccessResult(comptime RootCommand: type) type {
+pub fn SuccessResult(comptime RootCommand: type, comptime SubcommandGroup: type, comptime OptionGroup: type) type {
     return struct {
-        arena: *std.heap.ArenaAllocator,
-        args: []const []const u8,
-        deprecations: ?[]const Deprecation,
-        invoked_command: InvokedCommand(RootCommand),
-        root: *RootCommand,
-        unmatched_short_options: ?[]const u8,
+        _internal: struct {
+            action: BuiltinAction = .none,
+            arena: *std.heap.ArenaAllocator,
+            deprecations: ?[]const Deprecation = null,
+            resolved: Resolved(RootCommand, SubcommandGroup, OptionGroup),
+        },
+        args: []const []const u8 = &.{},
+        invoked_command: InvokedCommand(RootCommand) = .Default,
+        root: *RootCommand = undefined,
 
         pub fn deinit(self: *@This()) void {
-            const backing = self.arena.child_allocator;
-            self.arena.deinit();
-            backing.destroy(self.arena);
+            const backing = self._internal.arena.child_allocator;
+            self._internal.arena.deinit();
+            backing.destroy(self._internal.arena);
         }
     };
 }
@@ -2021,15 +2111,19 @@ fn default_print_help(allocator: Allocator, w: *std.Io.Writer, ctx: HelpContext)
     };
     var printed = false;
     if (ctx.command.prolog) |prolog| {
-        try w.print("{s}\n", .{prolog});
-        printed = true;
+        if (prolog.len > 0) {
+            try w.print("{s}\n", .{prolog});
+            printed = true;
+        }
     }
     if (ctx.command.summary) |summary| {
-        if (printed) {
-            try w.print("\n", .{});
+        if (summary.len > 0) {
+            if (printed) {
+                try w.print("\n", .{});
+            }
+            try w.print("{s}\n", .{summary});
+            printed = true;
         }
-        try w.print("{s}\n", .{summary});
-        printed = true;
     }
     if (ctx.command.usage) |usage| {
         if (printed) {
@@ -2049,13 +2143,15 @@ fn default_print_help(allocator: Allocator, w: *std.Io.Writer, ctx: HelpContext)
         printed = true;
     }
     if (ctx.command.description) |description| {
-        if (printed) {
+        if (description.len > 0) {
+            if (printed) {
+                try w.print("\n", .{});
+            }
+            try w.print("{s}Info:{s}\n", .{ heading, heading_end });
+            _ = try write_wrapped(w, description, spec);
             try w.print("\n", .{});
+            printed = true;
         }
-        try w.print("{s}Info:{s}\n", .{ heading, heading_end });
-        _ = try write_wrapped(w, description, spec);
-        try w.print("\n", .{});
-        printed = true;
     }
     const opt_indent = spec.indent + 4 + 2 + ctx.max_option_width + 3;
     for (ctx.option_groups) |group| {
@@ -2090,28 +2186,22 @@ fn default_print_help(allocator: Allocator, w: *std.Io.Writer, ctx: HelpContext)
                         .{ .indent = opt_indent, .start_col = col, .width = spec.width },
                     );
                 }
-                if (opt.deprecated) |deprecated| {
-                    if (deprecated.len > 0) {
-                        try w.print("{s}", .{ctx.style.deprecation});
-                        if (col > opt_indent) {
-                            try w.print(" ", .{});
-                        }
-                        col = try write_wrapped(
-                            w,
-                            std.fmt.allocPrint(allocator, "DEPRECATED: {s}", .{deprecated}) catch oom(ctx.app_name),
-                            .{ .indent = opt_indent, .start_col = col, .width = spec.width },
-                        );
-                        try w.print("{s}", .{ctx.style.deprecation_end});
+                if (opt.deprecated) |_| {
+                    try w.print("{s}", .{ctx.style.deprecation});
+                    if (col > opt_indent) {
+                        try w.print(" ", .{});
                     }
+                    col = try write_wrapped(w, "*deprecated*", .{ .indent = opt_indent, .start_col = col, .width = spec.width });
+                    try w.print("{s}", .{ctx.style.deprecation_end});
                 }
                 try w.print("\n", .{});
             }
             printed = true;
         }
     }
-    const command_indent = spec.indent + ctx.max_subcommand_width + 3;
-    for (ctx.subcommand_groups) |group| {
-        if (group.items.len > 0) {
+    if (ctx.has_subcommands) {
+        const command_indent = spec.indent + ctx.max_subcommand_width + 3;
+        for (ctx.subcommand_groups) |group| {
             if (printed) {
                 try w.print("\n", .{});
             }
@@ -2129,20 +2219,22 @@ fn default_print_help(allocator: Allocator, w: *std.Io.Writer, ctx: HelpContext)
             }
             printed = true;
         }
-    }
-    if (ctx.has_subcommands) {
-        if (ctx.command_path.len > 0) {
-            try w.print("\nSee '{s}{s} help {s} <command>{s}' for more information on a specific command.\n", .{ highlight, ctx.app_name, ctx.command_path, highlight_end });
-        } else {
-            try w.print("\nSee '{s}{s} help <command>{s}' for more information on a specific command.\n", .{ highlight, ctx.app_name, highlight_end });
+        if (ctx.has_help_command) {
+            if (ctx.command_path.len > 0) {
+                try w.print("\nSee '{s}{s} help {s} <command>{s}' for more information on a specific command.\n", .{ highlight, ctx.app_name, ctx.command_path, highlight_end });
+            } else {
+                try w.print("\nSee '{s}{s} help <command>{s}' for more information on a specific command.\n", .{ highlight, ctx.app_name, highlight_end });
+            }
         }
     }
     if (ctx.command.epilog) |epilog| {
-        if (printed) {
-            try w.print("\n", .{});
+        if (epilog.len > 0) {
+            if (printed) {
+                try w.print("\n", .{});
+            }
+            try w.print("{s}\n", .{epilog});
+            printed = true;
         }
-        try w.print("{s}\n", .{epilog});
-        printed = true;
     }
     try w.flush();
 }
@@ -2830,7 +2922,7 @@ const MyApp = struct {
         Bar: struct {
             hello: bool = false,
         },
-        baz: Duration,
+        baz: Duration = Duration{ .value = 1 },
     },
     Boom: struct {
         hmz: i64,
@@ -2857,12 +2949,13 @@ pub fn main(init: std.process.Init) !void {
     ).init(.{
         .name = "kickass",
         .show_defaults = true,
+        .enable_completion_command = true,
         .global_epilog = "This is an epilog",
         .global_prolog = "This is a prolog",
         .description = "This is a description",
         .summary = "This is a summary",
+        .version = "1.0.0",
         .usage = .{ .positional_args = "<input>" },
-        .help_style = .plain,
     });
 
     app.subcommand(.Foo, .{
@@ -2898,8 +2991,8 @@ pub fn main(init: std.process.Init) !void {
     var result = app.parse(init);
     defer result.deinit();
 
-    // try app.print_help(init.gpa, init.io, .Default);
-    try app.print_help(init.gpa, init.io, .Foo);
+    try app.print_help(init.gpa, init.io, .Default);
+    // try app.print_help(init.gpa, init.io, .Foo);
 
     switch (result.invoked_command) {
         .Default => {
