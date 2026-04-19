@@ -70,3 +70,89 @@ pub const PreferredDirection = enum {
     lower,
     higher,
 };
+
+const testing = std.testing;
+
+test "resolve effort level" {
+    const cases = [_]struct {
+        name: []const u8,
+        supported: []const EffortLevel,
+        effort: Effort,
+        expected: EffortLevel,
+    }{
+        .{
+            .name = "exact match with .lower",
+            .supported = &.{ .low, .medium, .high },
+            .effort = .{ .level = .medium, .prefer = .lower },
+            .expected = .medium,
+        },
+        .{
+            .name = "exact match with .higher",
+            .supported = &.{ .low, .medium, .high },
+            .effort = .{ .level = .medium, .prefer = .higher },
+            .expected = .medium,
+        },
+        .{
+            .name = "rounds down with .lower",
+            .supported = &.{ .low, .medium, .high },
+            .effort = .{ .level = .mhigh, .prefer = .lower },
+            .expected = .medium,
+        },
+        .{
+            .name = "rounds up with .higher",
+            .supported = &.{ .low, .medium, .high },
+            .effort = .{ .level = .mlow, .prefer = .higher },
+            .expected = .medium,
+        },
+        .{
+            .name = "clamps up when nothing is lower",
+            .supported = &.{ .high, .max },
+            .effort = .{ .level = .low, .prefer = .lower },
+            .expected = .high,
+        },
+        .{
+            .name = "clamps down when nothing is higher",
+            .supported = &.{ .min, .low },
+            .effort = .{ .level = .high, .prefer = .higher },
+            .expected = .low,
+        },
+        .{
+            .name = "unsorted supported slice",
+            .supported = &.{ .high, .low, .medium },
+            .effort = .{ .level = .mhigh, .prefer = .lower },
+            .expected = .medium,
+        },
+        .{
+            .name = "single element with .lower",
+            .supported = &.{.medium},
+            .effort = .{ .level = .high, .prefer = .lower },
+            .expected = .medium,
+        },
+        .{
+            .name = "single element with .higher",
+            .supported = &.{.medium},
+            .effort = .{ .level = .low, .prefer = .higher },
+            .expected = .medium,
+        },
+        .{
+            .name = "boundary exact match with .lower",
+            .supported = &.{ .medium, .high },
+            .effort = .{ .level = .medium, .prefer = .lower },
+            .expected = .medium,
+        },
+        .{
+            .name = "boundary exact match with .higher",
+            .supported = &.{ .low, .medium },
+            .effort = .{ .level = .medium, .prefer = .higher },
+            .expected = .medium,
+        },
+    };
+
+    for (cases) |c| {
+        const actual = c.effort.resolve(c.supported);
+        testing.expectEqual(c.expected, actual) catch |err| {
+            std.debug.print("case failed: {s}\n", .{c.name});
+            return err;
+        };
+    }
+}
