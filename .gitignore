@@ -1,28 +1,64 @@
-# Environment files
+# Build Outputs
+
+/build/
+/dep/wgpu-native/
+/dep/wuffs/
+/frontend/**/dist/
+/lib/sys/locale_info.zig
+/lib/time/tzdata.zig
+
+# Built Binary Files
+
+*.dll
+*.dylib
+*.exe
+*.o
+*.so
+
+# Debug Files
+
+*.pdb
+
+# Editors
+
+\#*#
+*.swo
+*.swp
+*~
+.#*
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Environment Files
 
 .env
-.env.local
 .env.*.local
+.env.local
 
-# Build files
+# Profiling & Coverage
 
-build/
-dep/wgpu-native/
+*.prof
+*.profdata
+*.profraw
+coverage/
+dhat-heap*.json
+flamegraph*.svg
+lcov.info
+perf.data*
 
-# Generated files
+# Temporary Files
 
-lib/sys/locale_info.zig
-lib/time/tzdata.zig
-
-# Temporary files
-
-*.tmp
 *.log
+*.out
+*.tmp
 temp/
 tmp/
 
 # Linux
 
+.Trash-*
+.directory
 .fuse_hidden*
 .nfs*
 
@@ -32,64 +68,50 @@ tmp/
 
 # Windows
 
-Desktop.ini
-Thumbs.db
-
-# IDEs
-
-*~
-*.swo
-*.swp
-.idea/
-.vscode/
-
-# AI tools
-
-.aider.chat.history.md
-
-# Generated files
-
-*.dll
-*.dylib
-*.exe
-*.gen.go
-*.pb.go
-*.so
-*.test
-coverage.txt
-
-# Compressed files
-
-*.gz
-*.tar
-*.tar.*
-*.tgz
-*.xz
-*.zip
+$RECYCLE.BIN/
+[Dd]esktop.ini
+Thumbs.db*
 
 # Go
 
-*.out
-cpu.prof
+*.gen.go
+*.pb.go
+*.test
 go.work
 go.work.sum
-mem.prof
-vendor/
 
 # Python
 
-**/__pycache__/
+.pytest_cache/
+.venv/
+__pycache__/
 
 # Rust
 
-*.pdb
-**/*.rs.bk
-Cargo.lock
-debug/
+**/fuzz/artifacts/
+**/fuzz/corpus/
+*.ll
+*.mir
+*.rs.bk
+/crate/**/pkg/
+mutants.out*/
+rustc-ice-*.txt
 target/
+
+# TypeScript
+
+*.tsbuildinfo
+.eslintcache
+.output/
+.vinxi/
+.vite/
+node_modules/
 
 # Zig
 
-*.o
 .zig-cache/
 zig-out/
+
+# Tauri
+
+**/gen/schemas/
